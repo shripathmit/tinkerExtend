@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 
 from .models import Chunk, Document
+
+
+def sanitize_fts_query(query: str) -> str:
+    """Make raw user text safe for FTS5 MATCH.
+
+    Terms are OR-ed; BM25 ranking surfaces chunks matching the most (and
+    rarest) terms. This handles both keyword queries and natural questions.
+    """
+    terms = re.findall(r"[A-Za-z0-9]+", query)
+    return " OR ".join(terms)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -129,6 +140,9 @@ class KnowledgeBase:
         return row is not None
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
+        fts_query = sanitize_fts_query(query)
+        if not fts_query:
+            return []
         rows = self.conn.execute(
             """SELECT c.chunk_id, c.doc_id, c.ordinal, c.content,
                       c.pages_json, c.token_estimate,
@@ -140,7 +154,7 @@ class KnowledgeBase:
                JOIN documents d ON d.doc_id = c.doc_id
                WHERE chunks_fts MATCH ?
                ORDER BY rank LIMIT ?""",
-            (query, limit),
+            (fts_query, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

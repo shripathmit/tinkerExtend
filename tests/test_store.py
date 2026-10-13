@@ -72,3 +72,16 @@ def test_delete_document():
     assert kb.search("refund") == []
     assert kb.stats()["documents"] == 0
     kb.close()
+
+
+def test_search_natural_language_query():
+    from tinker_extend.store import sanitize_fts_query
+    kb = make_kb()
+    kb.upsert_document(sample_doc())
+    kb.add_chunks(sample_chunks())
+    assert sanitize_fts_query("What was total revenue?") == "What OR was OR total OR revenue"
+    assert sanitize_fts_query("!!!") == ""
+    hits = kb.search("What is the refund policy?")
+    assert hits and hits[0]["chunk_id"] == "hash1:00000"
+    assert kb.search("???") == []
+    kb.close()

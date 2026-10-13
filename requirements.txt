@@ -1,6 +1,9 @@
-# Runtime needs only the Python standard library.
-# The official SDK is optional — tinker_extend talks to the REST API directly.
-# Uncomment to also install it for ad-hoc exploration:
+# Runtime: stdlib only for the pipeline; FastAPI for the web UI.
+fastapi>=0.110
+uvicorn>=0.29
+
+# The official Extend SDK is optional — tinker_extend talks to the REST API directly.
+# Uncomment for ad-hoc exploration:
 # extend-ai>=1.13.0
 
 # Dev / test

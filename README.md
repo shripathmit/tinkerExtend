@@ -51,6 +51,21 @@ python -m tinker_extend.cli stats --db ./kb.sqlite3
   add your provider to enable vector search later.
 - `pipeline.py` — orchestration with content-hash delta updates.
 
+## Web UI — search and Q&A
+
+```bash
+uvicorn --app-dir src tinker_extend.web:app --host 0.0.0.0 --port 8000
+```
+
+Open the page, type a question, and hit **Ask** (grounded Q&A with citations)
+or **Search** (raw full-text matches). Answers are extractive by default —
+the top passages, no hallucination. Set `TINKER_LLM_API_KEY` (plus optional
+`TINKER_LLM_BASE_URL` / `TINKER_LLM_MODEL`) to get generated answers from any
+OpenAI-compatible chat endpoint, still grounded and cited.
+
+Deploy: `Procfile` + `railway.json` are included. On first boot the app seeds
+itself from `./seed_docs` if the KB is empty and `EXTEND_API_KEY` is set.
+
 ## Tests
 
 ```bash

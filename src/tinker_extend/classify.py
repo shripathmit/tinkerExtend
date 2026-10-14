@@ -35,7 +35,7 @@ _RULES: list[tuple[str, list[str], list[str], float]] = [
      [r"executive summary", r"memorandum", r"key findings"],
      0.7),
     ("presentation",
-     [r"\.pptx?$", r"deck", r"slides"],
+     [r"\.pptx?$", r"deck", r"slides", r"presentation", r"earnings"],
      [r"slide \d+", r"agenda"],
      0.8),
 ]

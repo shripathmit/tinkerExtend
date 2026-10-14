@@ -297,6 +297,20 @@ class KnowledgeBase:
                               (doc_type, doc_id))
         self.conn.commit()
 
+    def update_telemetry_metrics(self, doc_id: str, metrics: dict) -> bool:
+        """Recompute fidelity metrics for a doc; keeps wave/engine/cost/duration."""
+        cur = self.conn.execute(
+            "UPDATE parse_telemetry SET num_pages=?, num_chunks=?, num_tables=?,"
+            " empty_chunks=?, garbled_chunks=?, text_coverage=?, ocr_confidence=?,"
+            " table_shape_ok=?, repeated_ngrams=? WHERE doc_id=?",
+            (metrics.get("num_pages", 0), metrics.get("num_chunks", 0),
+             metrics.get("table_blocks", 0), metrics.get("empty_chunks", 0),
+             metrics.get("garbled_chunks", 0), metrics.get("text_coverage"),
+             metrics.get("ocr_confidence"), metrics.get("table_shape_ok", 0),
+             metrics.get("repeated_ngrams", 0), doc_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def telemetry(self, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
             "SELECT t.*, d.source FROM parse_telemetry t"

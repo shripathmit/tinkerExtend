@@ -223,10 +223,18 @@ class WaveIngester:
             engine = self.profiles.get(pre_type, "parse_light")
             extend_file_id, run = self._parse_with_retry(client, path, engine)
             doc = pipe._store_run(file_hash, path, file_hash, extend_file_id, run)
-            blocks = run.get("blocks") or []
-            chunks = [r["content"] for r in
-                      kb.conn.execute("SELECT content FROM chunks WHERE doc_id=?",
-                                      (doc.doc_id,)).fetchall()]
+            # Blocks live per-chunk (run["output"]["chunks"][i]["blocks"]),
+            # so collect them from the stored chunks — same as boot backfill.
+            blocks: list = []
+            chunks: list = []
+            for r in kb.conn.execute(
+                    "SELECT content, blocks_json FROM chunks WHERE doc_id=?",
+                    (doc.doc_id,)).fetchall():
+                chunks.append(r["content"])
+                try:
+                    blocks.extend(json.loads(r["blocks_json"] or "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    pass
             metrics = fidelity_metrics(blocks, chunks)
             src_text = _source_text_words(path)
             if src_text:

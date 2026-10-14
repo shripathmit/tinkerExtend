@@ -140,3 +140,38 @@ def test_golden_doc_check():
     assert res["ok"] and res["probes_passed"] == 1
     res2 = check_golden_doc(spec, "nothing relevant here")
     assert not res2["ok"] and res2["probes"][0]["missing"] == ["decreased by $207 million"]
+
+
+def test_pages_from_blocks_metadata_shape():
+    # Regression: real Extend blocks nest the page under metadata.page.number;
+    # the old code only looked for a flat top-level "page" key and found nothing.
+    from tinker_extend.chunking import _pages_from_blocks, num_pages_in_run
+    blocks = [
+        {"type": "text", "content": "a",
+         "metadata": {"page": {"number": 3, "width": 100, "height": 100}}},
+        {"type": "text", "content": "b",
+         "metadata": {"page": {"number": 5, "width": 100, "height": 100}}},
+    ]
+    assert _pages_from_blocks(blocks) == [3, 5]
+    run = {"output": {"chunks": [{"content": "x", "blocks": blocks}]}}
+    assert num_pages_in_run(run) == 2
+
+
+def test_update_telemetry_metrics(tmp_path):
+    from tinker_extend.models import Document
+    kb = KnowledgeBase(str(tmp_path / "t.sqlite3"))
+    kb.upsert_document(Document(doc_id="d9", source="/tmp/z.pdf", file_hash="d9"))
+    kb.record_telemetry("d9", "w1", "other", "parse_light",
+                        {"num_pages": 0, "num_chunks": 5}, cost_usd=0.0,
+                        duration_s=3.0)
+    ok = kb.update_telemetry_metrics("d9", {"num_pages": 12, "num_chunks": 5,
+                                            "table_blocks": 2, "empty_chunks": 0,
+                                            "garbled_chunks": 0, "text_coverage": 0.97,
+                                            "ocr_confidence": 0.99,
+                                            "table_shape_ok": 2,
+                                            "repeated_ngrams": 0})
+    assert ok
+    row = kb.telemetry()[0]
+    assert row["num_pages"] == 12 and row["text_coverage"] == 0.97
+    assert row["wave"] == "w1" and row["duration_s"] == 3.0  # preserved
+    kb.close()

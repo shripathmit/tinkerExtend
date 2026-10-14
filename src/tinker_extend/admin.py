@@ -297,6 +297,62 @@ def api_uploads():
             "files": sorted(os.listdir(UPLOAD_DIR))}
 
 
+def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:
+    """Recompute fidelity metrics from stored blocks (no API calls).
+
+    Used when the metric code changes or a row was recorded with a bug.
+    Wave/engine/cost/duration are preserved.
+    """
+    doc = kb.conn.execute(
+        "SELECT doc_id, source FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+    if not doc:
+        return None
+    blocks: list = []
+    chunks: list = []
+    for r in kb.conn.execute(
+            "SELECT content, blocks_json FROM chunks WHERE doc_id=?", (doc_id,)):
+        chunks.append(r["content"])
+        try:
+            blocks.extend(json.loads(r["blocks_json"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    metrics = fidelity_metrics(blocks, chunks)
+    # Coverage when the source file is still around (uploads dir / seed dir).
+    src = doc["source"]
+    if src and os.path.exists(src):
+        try:
+            from pypdf import PdfReader
+            text = "\n".join((p.extract_text() or "") for p in PdfReader(src).pages)
+            if text.strip():
+                from .fidelity import text_coverage as _tc
+                metrics["text_coverage"] = _tc(text, "\n".join(chunks))
+        except Exception:
+            pass
+    kb.update_telemetry_metrics(doc_id, metrics)
+    return {"doc_id": doc_id, "metrics": metrics,
+            "flags": red_flags(metrics)}
+
+
+@router.post("/api/admin/telemetry/recompute")
+def api_telemetry_recompute(payload: dict):
+    doc_id = (payload or {}).get("doc_id")
+    kb = _kb()
+    try:
+        if doc_id:
+            res = recompute_doc_telemetry(kb, doc_id)
+            if not res:
+                return JSONResponse({"error": "doc not found"}, status_code=404)
+            return {"ok": True, "docs": [res]}
+        out = []
+        for r in kb.conn.execute("SELECT doc_id FROM parse_telemetry"):
+            res = recompute_doc_telemetry(kb, r["doc_id"])
+            if res:
+                out.append(res)
+        return {"ok": True, "docs": out}
+    finally:
+        kb.close()
+
+
 @router.post("/api/admin/waves")
 def api_start_wave(payload: dict):
     try:
@@ -597,10 +653,20 @@ async function loadIngest(){
       <td class="num">${r.text_coverage == null ? '—' : pct(r.text_coverage)}</td>
       <td class="num">${money(r.cost_usd)}</td><td class="num">${Number(r.duration_s || 0).toFixed(0)}s</td>
       <td>${statusPill(r.status)}</td>
-      <td>${r.flags.length ? `<span style="color:#f0b46a;font-size:12px">${esc(r.flags[0])}${r.flags.length > 1 ? ` (+${r.flags.length - 1})` : ''}</span>` : '<span style="color:#3fb950">—</span>'}</td></tr>`).join('') + `</table>`
+      <td>${r.flags.length ? `<span style="color:#f0b46a;font-size:12px">${esc(r.flags[0])}${r.flags.length > 1 ? ` (+${r.flags.length - 1})` : ''}</span>` : '<span style="color:#3fb950">—</span>'}
+      <br><button class="btn ghost small" style="margin-top:4px" onclick="recomputeRow('${r.doc_id}', this)">↻ recompute</button></td></tr>`).join('') + `</table>`
     : `<div class="empty">No telemetry yet.</div>`;
   renderJobs(ov.jobs);
   pollJobs();
+}
+
+async function recomputeRow(docId, btn){
+  btn.disabled = true;
+  try {
+    await api('/api/admin/telemetry/recompute', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({doc_id: docId})});
+    loadIngest();
+  } catch (e) { alert('recompute failed: ' + e.message); btn.disabled = false; }
 }
 
 function renderJobs(jobs){

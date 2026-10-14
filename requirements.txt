@@ -1,6 +1,7 @@
 # Runtime: stdlib only for the pipeline; FastAPI for the web UI.
 fastapi>=0.110
 python-multipart>=0.0.9
+pypdf>=4.0
 uvicorn>=0.29
 # Page rendering for the source viewer (trust UI).
 pymupdf>=1.24

@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from .config import load_config
 from .extend_client import ExtendClient
-from .fidelity import check_golden_doc, load_golden_docs, red_flags
+from .fidelity import check_golden_doc, fidelity_metrics, load_golden_docs, red_flags
 from .ingest import SUPPORTED_EXTENSIONS, iter_candidate_files, sha256_file
 from .pipeline import WaveIngester
 from .store import KnowledgeBase

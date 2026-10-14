@@ -175,3 +175,30 @@ def test_update_telemetry_metrics(tmp_path):
     assert row["num_pages"] == 12 and row["text_coverage"] == 0.97
     assert row["wave"] == "w1" and row["duration_s"] == 3.0  # preserved
     kb.close()
+
+
+def test_recompute_doc_telemetry(tmp_path):
+    # Regression: recompute_doc_telemetry referenced fidelity_metrics without
+    # importing it (NameError in production).
+    import json as _json
+    from tinker_extend.admin import recompute_doc_telemetry
+    from tinker_extend.models import Chunk, Document
+    kb = KnowledgeBase(str(tmp_path / "t.sqlite3"))
+    kb.upsert_document(Document(doc_id="d10", source="/tmp/z.pdf", file_hash="d10"))
+    blocks = [{"type": "text", "content": "hello world, this is a real chunk",
+               "metadata": {"page": {"number": 2, "width": 10, "height": 10}}}]
+    kb.conn.execute(
+        "INSERT INTO chunks (chunk_id, doc_id, ordinal, content, blocks_json,"
+        " pages_json, token_estimate) VALUES (?,?,?,?,?,?,?)",
+        ("d10:00000", "d10", 0, "hello world, this is a real chunk",
+         _json.dumps(blocks), "[2]", 8))
+    kb.conn.commit()
+    kb.record_telemetry("d10", "w1", "other", "parse_light",
+                        {"num_pages": 0, "num_chunks": 1}, cost_usd=0.0,
+                        duration_s=1.0)
+    res = recompute_doc_telemetry(kb, "d10")
+    assert res["metrics"]["num_pages"] == 1
+    assert res["metrics"]["num_chunks"] == 1
+    assert kb.telemetry()[0]["num_pages"] == 1
+    assert recompute_doc_telemetry(kb, "missing") is None
+    kb.close()

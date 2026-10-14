@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Strict zero-radius architectural mandate (from the prototype). */
+*, *::before, *::after { border-radius: 0 !important; box-sizing: border-box; }
+
+body {
+  background-color: #090A0C;
+  color: #F3F4F6;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1F232C; }
+::-webkit-scrollbar-thumb:hover { background: #333846; }
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+.tabular-nums { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 1px solid #F3F4F6; outline-offset: 2px; }
+.chunk-passage { transition: background-color .2s ease, border-color .2s ease, opacity .2s ease; }
+
+/* Page-image highlight boxes */
+.hl { position: absolute; pointer-events: auto; cursor: pointer; }
+.hl-active { background: rgba(245, 158, 11, .22); outline: 2px solid rgba(245, 158, 11, .9); }
+.hl-other { background: rgba(59, 130, 246, .06); outline: 1px solid rgba(59, 130, 246, .45); }
+
+/* Answer text */
+.answer p { margin: 0; }
+.answer strong { font-weight: 600; color: #F3F4F6; }
+.answer-quote { border-left: 1px solid #2A2E39; padding-left: 1.25rem; color: #F3F4F6; }
+.answer-quote > * + * { margin-top: .75rem; }
+.answer-quote.is-clamped {
+  max-height: 17rem; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent);
+          mask-image: linear-gradient(to bottom, #000 70%, transparent);
+}
+.cite {
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #3B82F6;
+  margin-left: 2px; background: none; border: 0; padding: 0; cursor: pointer;
+}
+.cite:hover { text-decoration: underline; }
+
+/* Parsed chunk HTML (markdown -> safe HTML): tables, headings, lists */
+.doc-html h1, .doc-html h2, .doc-html h3, .doc-html h4,
+.answer-quote h1, .answer-quote h2, .answer-quote h3, .answer-quote h4 {
+  font-size: 12px; font-weight: 500; letter-spacing: .04em; text-transform: uppercase; opacity: .85;
+}
+.doc-html ul, .answer-quote ul { list-style: disc; padding-left: 1.25rem; }
+.doc-html ol, .answer-quote ol { list-style: decimal; padding-left: 1.25rem; }
+.doc-html table, .answer-quote table {
+  width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; line-height: 1.5; display: block; overflow-x: auto;
+}
+.doc-html th, .doc-html td, .answer-quote th, .answer-quote td {
+  border-bottom: 1px solid rgba(127, 127, 127, .25); padding: 4px 8px 4px 0; text-align: left;
+  vertical-align: top; font-variant-numeric: tabular-nums;
+}
+.doc-html th, .answer-quote th { font-weight: 500; }

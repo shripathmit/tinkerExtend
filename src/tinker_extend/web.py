@@ -1,4 +1,4 @@
-"""Web UI: Perplexity-style Q&A over the knowledge base.
+"""Web app: the unified tinkerExtend UI (static/) and its public JSON API.
 
 Left pane: the source document page the answer came from, with the exact
 regions highlighted. Right pane: the answer with citations, plus a
@@ -17,7 +17,7 @@ import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -111,6 +111,7 @@ def enrich_passage(kb: KnowledgeBase, p: dict) -> dict:
                 "boxes": info["boxes"],
             })
     return {**p, "sources": sources,
+            "doc_id": row["doc_id"] if row else None,
             "doc_name": os.path.basename(p["doc_source"]),
             "content_html": to_safe_html(p["content"])}
 
@@ -195,14 +196,23 @@ app = FastAPI(title="tinkerExtend Q&A", lifespan=lifespan)
 APP_VERSION = __version__
 os.makedirs(PAGE_IMG_DIR, exist_ok=True)
 app.mount("/page_images", StaticFiles(directory=PAGE_IMG_DIR), name="page_images")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(admin_router)
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"),
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/stats")
 def api_stats():
     kb = get_kb()
     try:
-        return {**kb.stats(), "embed_model": embedder_from_env().model}
+        return {**kb.stats(), "embed_model": embedder_from_env().model,
+                "llm_configured": llm_from_env() is not None, "version": __version__}
     finally:
         kb.close()
 
@@ -228,12 +238,15 @@ def api_search(q: str, limit: int = 10):
 def api_ask(payload: dict):
     question = (payload.get("question") or "").strip()
     limit = int(payload.get("limit") or 5)
+    # synthesize=false forces an extractive answer even with an LLM configured.
+    synthesize = payload.get("synthesize", True) is not False
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
     kb = get_kb()
     try:
-        result = ask(question, kb, llm=llm_from_env(), limit=limit,
-                     embedder=embedder_from_env())
+        embedder = embedder_from_env()
+        result = ask(question, kb, llm=llm_from_env() if synthesize else None,
+                     limit=limit, embedder=embedder)
         passages = [enrich_passage(kb, p) for p in result.get("passages", [])]
         if result["mode"] == "extractive":
             answer_html = to_safe_html(result["answer"])
@@ -247,6 +260,7 @@ def api_ask(payload: dict):
             "answer_html": answer_html,
             "answer_text": result["answer"],
             "note": result.get("note", ""),
+            "search": "hybrid" if embedder.model else "keyword",
             "passages": passages,
             "chunk_ids": [p["chunk_id"] for p in passages],
         }
@@ -269,7 +283,10 @@ def api_feedback(payload: dict):
             chunk_ids=list(payload.get("chunk_ids") or []),
             rating=rating,
             comment=str(payload.get("comment") or ""),
+            issue=str(payload.get("issue") or ""),
+            active_chunk_id=str(payload.get("active_chunk_id") or ""),
         )
+        kb.set_meta("golden_last_run", "")  # new assertion: next view re-runs
         return {"ok": True, "id": fid}
     finally:
         kb.close()
@@ -292,293 +309,52 @@ def api_feedback_export():
     return PlainTextResponse("\n".join(lines), media_type="application/x-ndjson")
 
 
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tinkerExtend Q&A</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-         background: #0e1116; color: #e6e9ef; margin: 0; padding: 20px 24px; }
-  .wrap { max-width: 1400px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
-  h1 { font-size: 22px; margin: 0; }
-  .sub { color: #8b93a3; font-size: 13px; }
-  .box { display: flex; gap: 8px; margin-bottom: 18px; max-width: 900px; }
-  input[type=text] { flex: 1; padding: 12px 14px; font-size: 15px; border-radius: 10px;
-    border: 1px solid #2a3140; background: #161b24; color: #e6e9ef; }
-  button.go { padding: 12px 20px; font-size: 15px; border-radius: 10px; border: 0;
-    background: #2f6fed; color: white; cursor: pointer; font-weight: 600; }
-  button.ghost { background: #1c2330; border: 1px solid #2a3140; color: #e6e9ef;
-    padding: 12px 20px; font-size: 15px; border-radius: 10px; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  .status { color: #8b93a3; font-size: 13px; margin: 10px 0; min-height: 18px; }
-  .layout { display: grid; grid-template-columns: minmax(360px, 5fr) 7fr; gap: 20px;
-    align-items: start; }
-  /* ---- source viewer (left) ---- */
-  .viewer { position: sticky; top: 16px; background: #10141b;
-    border: 1px solid #232b3b; border-radius: 12px; padding: 14px; }
-  .viewer .vhead { font-size: 12px; color: #8b93a3; margin-bottom: 10px;
-    display: flex; justify-content: space-between; gap: 8px; }
-  .viewer .vhead b { color: #c8cfdb; font-weight: 600; }
-  .pagewrap { position: relative; background: #fff; border-radius: 6px; overflow: hidden; }
-  .pagewrap img { display: block; width: 100%; height: auto; }
-  .hl { position: absolute; background: rgba(255, 196, 0, .28);
-    border: 2px solid rgba(255, 170, 0, .85); border-radius: 2px;
-    pointer-events: none; }
-  .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
-  .pager button { background: #1c2330; border: 1px solid #2a3140; color: #e6e9ef;
-    border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
-  .pager .pg { font-size: 12px; color: #8b93a3; }
-  .thumbs { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
-  .thumbs button { background: #1c2330; border: 1px solid #2a3140; color: #9fb3d9;
-    border-radius: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
-  .thumbs button.active { border-color: #2f6fed; color: #fff; background: #22345c; }
-  .vempty { color: #5c6577; font-size: 13px; text-align: center; padding: 40px 10px; }
-  /* ---- answer column (right) ---- */
-  .answer { background: #141a26; border: 1px solid #2a3a5f; border-radius: 12px;
-    padding: 18px 20px; margin-bottom: 14px; line-height: 1.6; font-size: 15px; }
-  .answer .mode { font-size: 11px; color: #8b93a3; text-transform: uppercase;
-    letter-spacing: .08em; margin-bottom: 10px; }
-  .answer table { border-collapse: collapse; margin: 10px 0; font-size: 13px;
-    display: block; overflow-x: auto; }
-  .answer th, .answer td { border: 1px solid #3a4358; padding: 6px 10px; text-align: left; }
-  .answer th { background: #1d2536; }
-  .answer h2, .answer h3, .answer h4 { margin: 14px 0 6px; font-size: 16px; }
-  .cite { background: #22345c; border: 1px solid #2f6fed; color: #bcd0ff;
-    border-radius: 6px; padding: 1px 7px; font-size: 12px; cursor: pointer; margin: 0 1px; }
-  .cite:hover { background: #2f6fed; color: #fff; }
-  .feedback { margin-top: 14px; padding-top: 12px; border-top: 1px solid #232b3b; }
-  .feedback .flabel { font-size: 12px; color: #8b93a3; margin-bottom: 8px; }
-  .feedback .frow { display: flex; gap: 8px; align-items: center; }
-  .fb { background: #1c2330; border: 1px solid #2a3140; color: #e6e9ef;
-    border-radius: 8px; padding: 7px 14px; cursor: pointer; font-size: 14px; }
-  .fb.sel-up { border-color: #2fa84f; background: #14301f; }
-  .fb.sel-down { border-color: #d64545; background: #331414; }
-  .feedback textarea { width: 100%; margin-top: 8px; background: #161b24; color: #e6e9ef;
-    border: 1px solid #2a3140; border-radius: 8px; padding: 8px; font-size: 13px;
-    font-family: inherit; resize: vertical; }
-  .feedback .thanks { color: #7fd08a; font-size: 13px; }
-  .passage { background: #131720; border: 1px solid #232b3b; border-radius: 10px;
-    padding: 14px 16px; margin-bottom: 10px; cursor: pointer; }
-  .passage:hover { border-color: #2f6fed; }
-  .passage.active { border-color: #2f6fed; box-shadow: 0 0 0 1px #2f6fed; }
-  .passage .meta { font-size: 12px; color: #8b93a3; margin-bottom: 8px; }
-  .passage .meta b { color: #c8cfdb; }
-  .passage .pbody { font-size: 13.5px; line-height: 1.55; max-height: 200px;
-    overflow: auto; color: #c9d1de; }
-  .passage .pbody table { border-collapse: collapse; margin: 8px 0; font-size: 12px;
-    display: block; overflow-x: auto; }
-  .passage .pbody th, .passage .pbody td { border: 1px solid #3a4358; padding: 5px 8px; }
-  .passage .pbody th { background: #1d2536; }
-  .passage .pbody h2, .passage .pbody h3, .passage .pbody h4 { font-size: 14px; margin: 10px 0 4px; }
-  @media (max-width: 920px) {
-    .layout { grid-template-columns: 1fr; }
-    .viewer { position: static; order: 2; }
-    .qacol { order: 1; }
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header><h1>tinkerExtend Q&amp;A</h1><div class="sub" id="stats">loading…</div>
-    <div style="flex:1"></div><a href="/admin" style="color:#7ea2ff;font-size:13px;text-decoration:none">Console →</a></header>
-  <div class="box">
-    <input type="text" id="q" placeholder="Ask about your documents…" autocomplete="off">
-    <button class="go" id="askBtn">Ask</button>
-    <button class="ghost" id="searchBtn">Search</button>
-  </div>
-  <div class="status" id="status"></div>
-  <div class="layout">
-    <section class="viewer" id="viewer">
-      <div class="vempty">Ask a question — the source page behind the answer will appear here.</div>
-    </section>
-    <section class="qacol">
-      <div id="answer"></div>
-      <div id="results"></div>
-    </section>
-  </div>
-</div>
-<script>
-const q = document.getElementById('q');
-const statusEl = document.getElementById('status');
-const answerEl = document.getElementById('answer');
-const resultsEl = document.getElementById('results');
-const viewerEl = document.getElementById('viewer');
-let current = null;   // {question, mode, answer_text, chunk_ids, passages}
-let viewState = null; // {passageIdx, pageIdx}
-
-fetch('/api/stats').then(r => r.json()).then(s => {
-  document.getElementById('stats').textContent =
-    s.documents + ' documents · ' + s.chunks + ' chunks · ~' + s.token_estimate + ' tokens' +
-    (s.embed_model ? ' · hybrid search (' + s.embedded_chunks + ' embedded)' : ' · keyword search');
-});
-
-function esc(t){ const d=document.createElement('div'); d.textContent=t; return d.innerHTML; }
-
-function allSourcePages(){
-  const out = [];
-  (current.passages || []).forEach((p, pi) => {
-    (p.sources || []).forEach((s, si) => {
-      if (s.image_url) out.push({passageIdx: pi, pageIdx: si, n: p.n, page: s.page,
-        image_url: s.image_url, boxes: s.boxes, width: s.width, height: s.height,
-        doc: p.doc_name});
-    });
-  });
-  return out;
-}
-
-function renderViewer(){
-  const pages = allSourcePages();
-  if (!pages.length) {
-    viewerEl.innerHTML = '<div class="vempty">No page images for these sources.</div>';
-    return;
-  }
-  if (!viewState || viewState.passageIdx >= current.passages.length) {
-    viewState = {passageIdx: 0, pageIdx: 0};
-  }
-  // find the flat index matching viewState
-  let flat = pages.findIndex(x => x.passageIdx === viewState.passageIdx && x.pageIdx === viewState.pageIdx);
-  if (flat < 0) flat = 0;
-  const cur = pages[flat];
-  const boxes = (cur.boxes || []).map(b => {
-    const l = (b.left / cur.width * 100).toFixed(2), t = (b.top / cur.height * 100).toFixed(2);
-    const w = ((b.right - b.left) / cur.width * 100).toFixed(2);
-    const h = ((b.bottom - b.top) / cur.height * 100).toFixed(2);
-    return `<div class="hl" style="left:${l}%;top:${t}%;width:${w}%;height:${h}%"></div>`;
-  }).join('');
-  const thumbs = pages.map((x, i) =>
-    `<button data-i="${i}" class="${i === flat ? 'active' : ''}">[${x.n}] p.${x.page}</button>`).join('');
-  viewerEl.innerHTML =
-    `<div class="vhead"><span><b>Source</b> · ${esc(cur.doc)}</span><span>p.${cur.page}</span></div>
-     <div class="pagewrap"><img src="${esc(cur.image_url)}" alt="source page">${boxes}</div>
-     <div class="pager">
-       <button id="pgPrev">← Prev</button>
-       <button id="pgNext">Next →</button>
-       <span class="pg">${flat + 1} / ${pages.length} cited pages</span>
-     </div>
-     <div class="thumbs">${thumbs}</div>`;
-  const go = i => {
-    const t = pages[(i + pages.length) % pages.length];
-    viewState = {passageIdx: t.passageIdx, pageIdx: t.pageIdx};
-    markActive(t.passageIdx); renderViewer();
-  };
-  document.getElementById('pgPrev').onclick = () => go(flat - 1);
-  document.getElementById('pgNext').onclick = () => go(flat + 1);
-  viewerEl.querySelectorAll('.thumbs button').forEach(b => {
-    b.onclick = () => go(parseInt(b.dataset.i, 10));
-  });
-}
-
-function markActive(pi){
-  resultsEl.querySelectorAll('.passage').forEach((el, i) => {
-    el.classList.toggle('active', i === pi);
-  });
-}
-
-function showSourceForPassage(pi, si){
-  viewState = {passageIdx: pi, pageIdx: si || 0};
-  markActive(pi); renderViewer();
-  viewerEl.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-}
-
-function feedbackWidget(){
-  return `<div class="feedback" id="fb">
-    <div class="flabel">Was this answer right? Your feedback trains the eval set.</div>
-    <div class="frow">
-      <button class="fb" id="fbUp" title="Helpful">👍 Yes</button>
-      <button class="fb" id="fbDown" title="Not helpful">👎 No</button>
-    </div>
-    <textarea id="fbComment" rows="2" placeholder="What was wrong? (optional)"></textarea>
-  </div>`;
-}
-
-function wireFeedback(){
-  const box = document.getElementById('fb');
-  if (!box || !current) return;
-  const send = async rating => {
-    const comment = document.getElementById('fbComment').value;
-    const r = await fetch('/api/feedback', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: current.question, mode: current.mode,
-        answer: current.answer_text, chunk_ids: current.chunk_ids,
-        rating, comment})});
-    if (r.ok) box.innerHTML = '<div class="thanks">Thanks — recorded. This helps catch bad answers.</div>';
-  };
-  document.getElementById('fbUp').onclick = e => {
-    e.target.classList.add('sel-up'); send(1);
-  };
-  document.getElementById('fbDown').onclick = e => {
-    e.target.classList.add('sel-down'); send(-1);
-  };
-}
-
-function renderPassages(){
-  resultsEl.innerHTML = (current.passages || []).map((p, i) =>
-    `<div class="passage" data-i="${i}">
-       <div class="meta"><b>[${p.n}]</b> ${esc(p.doc_name)} · ` +
-       ((p.sources || []).map(s => 'p.' + s.page).join(', ') || 'no page info') + `</div>
-       <div class="pbody">${p.content_html}</div>
-     </div>`).join('');
-  resultsEl.querySelectorAll('.passage').forEach(el => {
-    el.onclick = () => showSourceForPassage(parseInt(el.dataset.i, 10), 0);
-  });
-  answerEl.querySelectorAll('.cite').forEach(c => {
-    c.onclick = () => {
-      const n = parseInt(c.dataset.n, 10);
-      const pi = (current.passages || []).findIndex(p => p.n === n);
-      if (pi >= 0) showSourceForPassage(pi, 0);
-    };
-  });
-}
-
-async function doAsk(){
-  const question = q.value.trim();
-  if (!question) return;
-  statusEl.textContent = 'Thinking…'; answerEl.innerHTML = ''; resultsEl.innerHTML = '';
-  viewerEl.innerHTML = '<div class="vempty">Finding sources…</div>';
-  const r = await fetch('/api/ask', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({question, limit: 5})});
-  const data = await r.json();
-  statusEl.textContent = '';
-  if (data.error) { statusEl.textContent = data.error; return; }
-  current = data; viewState = null;
-  answerEl.innerHTML = `<div class="answer"><div class="mode">answer · ${esc(data.mode)}</div>` +
-    data.answer_html +
-    (data.note ? `<div class="mode" style="margin-top:10px">${esc(data.note)}</div>` : '') +
-    feedbackWidget() + `</div>`;
-  wireFeedback();
-  renderPassages();
-  renderViewer();
-}
-
-async function doSearch(){
-  const query = q.value.trim();
-  if (!query) return;
-  statusEl.textContent = 'Searching…'; answerEl.innerHTML = ''; resultsEl.innerHTML = '';
-  const r = await fetch('/api/search?q=' + encodeURIComponent(query) + '&limit=10');
-  const data = await r.json();
-  current = {question: query, mode: 'search', answer_text: '', chunk_ids: [],
-    passages: data.hits.map((h, i) => ({...h, n: i + 1}))};
-  viewState = null;
-  statusEl.textContent = data.hits.length + ' matches — click a passage to see its source page';
-  renderPassages();
-  renderViewer();
-}
-
-document.getElementById('askBtn').onclick = doAsk;
-document.getElementById('searchBtn').onclick = doSearch;
-q.addEventListener('keydown', e => { if (e.key === 'Enter') doAsk(); });
-</script>
-</body>
-</html>
-"""
+@app.get("/api/examples")
+def api_examples(n: int = 3):
+    """A few answerable golden questions for the Q&A tab's "Try:" row."""
+    from .admin import GOLDEN_QA
+    from .eval import load_eval_set
+    if not os.path.exists(GOLDEN_QA):
+        return {"examples": []}
+    cases = [c.question for c in load_eval_set(GOLDEN_QA) if c.answerable]
+    return {"examples": cases[:max(0, min(n, 10))]}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return PAGE
+@app.get("/api/page/{doc_id}/{page}")
+def api_page(doc_id: str, page: int):
+    """One source page: image, size, page count, and every chunk on it
+    (with highlight boxes and safe HTML) for the viewer's image and
+    reader modes."""
+    kb = get_kb()
+    try:
+        doc = kb.get_document(doc_id)
+        if not doc:
+            return JSONResponse({"error": "doc not found"}, status_code=404)
+        chunks, size = [], {"width": None, "height": None}
+        for r in kb.conn.execute(
+                "SELECT chunk_id, ordinal, content, blocks_json, pages_json FROM chunks"
+                " WHERE doc_id = ? ORDER BY ordinal", (doc_id,)):
+            try:
+                pages = json.loads(r["pages_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                pages = []
+            if page not in pages:
+                continue
+            info = page_boxes(r["blocks_json"]).get(page) or {}
+            if info.get("width") and not size["width"]:
+                size = {"width": info["width"], "height": info["height"]}
+            chunks.append({"chunk_id": r["chunk_id"], "ordinal": r["ordinal"],
+                           "boxes": info.get("boxes", []),
+                           "content_html": to_safe_html(r["content"])})
+        img_path = os.path.join(PAGE_IMG_DIR, doc_id, f"p{page}.png")
+        num_pages = doc.get("num_pages") or 0
+        if os.path.isdir(os.path.join(PAGE_IMG_DIR, doc_id)):
+            num_pages = max(num_pages, sum(
+                1 for f in os.listdir(os.path.join(PAGE_IMG_DIR, doc_id))
+                if f.startswith("p") and f.endswith(".png")))
+        return {"doc_id": doc_id, "doc_name": os.path.basename(doc["source"]),
+                "page": page, "num_pages": num_pages,
+                "image_url": f"/page_images/{doc_id}/p{page}.png" if os.path.exists(img_path) else None,
+                **size, "chunks": chunks}
+    finally:
+        kb.close()

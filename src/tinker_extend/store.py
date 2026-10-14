@@ -119,7 +119,19 @@ CREATE TABLE IF NOT EXISTS feedback (
   answer       TEXT NOT NULL DEFAULT '',
   chunk_ids    TEXT NOT NULL DEFAULT '[]',
   rating       INTEGER NOT NULL,          -- +1 helpful, -1 not helpful
-  comment      TEXT NOT NULL DEFAULT ''
+  comment      TEXT NOT NULL DEFAULT '',
+  issue        TEXT NOT NULL DEFAULT '',  -- e.g. "Wrong chunk" on a -1
+  active_chunk_id TEXT NOT NULL DEFAULT '',
+  resolved     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reparse_history (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id      TEXT NOT NULL,
+  engine      TEXT NOT NULL,
+  before_json TEXT NOT NULL DEFAULT '{}',
+  after_json  TEXT NOT NULL DEFAULT '{}',
+  cost_usd    REAL NOT NULL DEFAULT 0,
+  at          TEXT NOT NULL
 );
 """
 
@@ -143,6 +155,23 @@ class KnowledgeBase:
         for name, decl in (("embedding", "BLOB"), ("embedding_model", "TEXT")):
             if name not in ccols:
                 self.conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {decl}")
+        fcols = {r[1] for r in self.conn.execute("PRAGMA table_info(feedback)")}
+        for name, decl in (("issue", "TEXT NOT NULL DEFAULT ''"),
+                           ("active_chunk_id", "TEXT NOT NULL DEFAULT ''"),
+                           ("resolved", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in fcols:
+                self.conn.execute(f"ALTER TABLE feedback ADD COLUMN {name} {decl}")
+        self.conn.commit()
+
+    # -- small key/value store -------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM kb_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO kb_meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
         self.conn.commit()
 
     # -- vector revision (cache invalidation) ------------------------------
@@ -398,16 +427,18 @@ class KnowledgeBase:
                 "embedded_chunks": embedded}
 
     def add_feedback(self, question: str, answer_mode: str, answer: str,
-                     chunk_ids: list, rating: int, comment: str = "") -> int:
+                     chunk_ids: list, rating: int, comment: str = "",
+                     issue: str = "", active_chunk_id: str = "") -> int:
         """Record a thumbs up/down on an answer. Returns the feedback id."""
         import datetime
         cur = self.conn.execute(
             "INSERT INTO feedback (created_at, question, answer_mode, answer,"
-            " chunk_ids, rating, comment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " chunk_ids, rating, comment, issue, active_chunk_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (datetime.datetime.now(datetime.timezone.utc).isoformat(),
              question, answer_mode, answer[:4000],
              json.dumps(chunk_ids or []), 1 if rating > 0 else -1,
-             comment[:2000]),
+             comment[:2000], issue[:100], active_chunk_id[:200]),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -417,6 +448,39 @@ class KnowledgeBase:
             "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def resolve_feedback(self, fid: int) -> bool:
+        cur = self.conn.execute("UPDATE feedback SET resolved = 1 WHERE id = ?", (fid,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def add_reparse_history(self, doc_id: str, engine: str, before: dict,
+                            after: dict, cost_usd: float) -> None:
+        self.conn.execute(
+            "INSERT INTO reparse_history (doc_id, engine, before_json, after_json,"
+            " cost_usd, at) VALUES (?,?,?,?,?,?)",
+            (doc_id, engine, json.dumps(before), json.dumps(after), cost_usd,
+             self._now()))
+        self.conn.commit()
+
+    def reparse_history(self, doc_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM reparse_history WHERE doc_id = ? ORDER BY id DESC",
+            (doc_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["before"] = json.loads(d.pop("before_json") or "{}")
+            d["after"] = json.loads(d.pop("after_json") or "{}")
+            out.append(d)
+        return out
+
+    def telemetry_row(self, doc_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT t.*, d.source FROM parse_telemetry t"
+            " JOIN documents d ON d.doc_id = t.doc_id WHERE t.doc_id = ?",
+            (doc_id,)).fetchone()
+        return dict(row) if row else None
 
     # -- Phase 0/1: telemetry, waves, dead letters -----------------------
     @staticmethod

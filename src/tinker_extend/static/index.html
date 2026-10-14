@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tinkerExtend</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23090A0C'/%3E%3Crect x='4' y='4' width='8' height='8' fill='%23F3F4F6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="h-screen w-screen overflow-hidden flex flex-col">
+
+  <!-- ================================================================ -->
+  <!-- HEADER: wordmark + corpus stats + 5 tabs | LLM mode + refresh     -->
+  <!-- ================================================================ -->
+  <header class="px-4 sm:px-6 lg:px-8 bg-canvas border-b border-hairline flex flex-wrap md:flex-nowrap items-center justify-between shrink-0 z-30 md:h-12">
+    <div class="flex items-center space-x-3.5 shrink-0 h-12 order-1">
+      <a href="#qa" class="font-medium text-sm tracking-tight text-ink">tinkerExtend</a>
+      <span class="text-hairlineFocus hidden sm:inline">·</span>
+      <span id="nav-corpus-meta" class="hidden sm:inline font-mono text-xs text-inkFaint tabular-nums"></span>
+    </div>
+
+    <nav id="tabs" class="order-3 md:order-2 w-[calc(100%+2rem)] -mx-4 px-4 sm:w-[calc(100%+3rem)] sm:-mx-6 sm:px-6 md:w-auto md:mx-0 md:px-0 md:flex-1 md:ml-8 h-11 md:h-full flex items-center space-x-5 md:space-x-6 overflow-x-auto no-scrollbar border-t border-hairline md:border-t-0">
+      <a href="#qa" data-tab="qa" class="tab h-full flex items-center text-xs font-medium tracking-wide border-b shrink-0">Q&amp;A</a>
+      <a href="#overview" data-tab="overview" class="tab h-full flex items-center text-xs font-medium tracking-wide border-b shrink-0">Overview</a>
+      <a href="#ingestion" data-tab="ingestion" class="tab h-full flex items-center space-x-1.5 text-xs font-medium tracking-wide border-b shrink-0">
+        <span>Ingestion</span>
+        <span id="nav-ingest-count" class="font-mono text-[11px] text-inkFaint tabular-nums"></span>
+      </a>
+      <a href="#fidelity" data-tab="fidelity" class="tab h-full flex items-center space-x-2 text-xs font-medium tracking-wide border-b shrink-0">
+        <span>Parse Fidelity</span>
+        <span id="nav-warn-dot" class="hidden w-1.5 h-1.5 bg-amberWarn inline-block"></span>
+      </a>
+      <a href="#golden" data-tab="golden" class="tab h-full flex items-center space-x-1.5 text-xs font-medium tracking-wide border-b shrink-0">
+        <span>Golden Sets</span>
+        <span id="nav-golden-count" class="font-mono text-[11px] text-inkFaint tabular-nums"></span>
+      </a>
+    </nav>
+
+    <div class="order-2 md:order-3 flex items-center space-x-4 sm:space-x-5 shrink-0 h-12 md:ml-6">
+      <button id="mode-toggle-btn" type="button" class="flex items-center space-x-2 text-xs text-inkMuted hover:text-ink transition-colors py-1">
+        <span class="text-inkFaint">LLM:</span>
+        <span id="mode-toggle-label" class="font-mono text-amberWarn">Extractive</span>
+      </button>
+      <span class="text-hairlineFocus">|</span>
+      <button id="refresh-btn" type="button" class="font-mono text-xs text-inkFaint hover:text-ink transition-colors">Refresh</button>
+      <button id="lock-btn" type="button" class="hidden font-mono text-xs text-inkFaint hover:text-ink transition-colors" title="Lock the console tabs on this browser">Lock</button>
+    </div>
+  </header>
+
+  <!-- ================================================================ -->
+  <!-- VIEW 1: Q&A WORKSPACE                                             -->
+  <!-- ================================================================ -->
+  <main id="view-qa" data-view="qa" class="view hidden flex-1 flex flex-col lg:flex-row min-h-0 overflow-y-auto lg:overflow-hidden">
+
+    <section class="w-full lg:w-[52%] lg:h-full lg:overflow-y-auto px-4 py-8 sm:px-8 sm:py-10 lg:px-12 lg:py-12 border-b lg:border-b-0 lg:border-r border-hairline bg-canvas">
+      <div class="max-w-[640px] mx-auto space-y-10">
+
+        <div class="space-y-3">
+          <form id="query-form" class="flex items-center border-b border-hairlineFocus focus-within:border-ink transition-colors pb-2">
+            <input id="query-input" type="text" autocomplete="off"
+              placeholder="Ask a question or search across documents..."
+              class="flex-1 min-w-0 bg-transparent text-base text-ink placeholder-inkFaint focus:outline-none pr-4" />
+            <div class="flex items-center space-x-1 text-xs font-mono shrink-0" role="group" aria-label="Query type">
+              <button type="button" id="switch-ask" data-search-type="ask" class="px-2.5 py-1 transition-colors">Ask</button>
+              <button type="button" id="switch-search" data-search-type="search" class="px-2.5 py-1 transition-colors">Search</button>
+            </div>
+          </form>
+          <div id="examples" class="flex items-center space-x-4 text-xs text-inkFaint overflow-x-auto no-scrollbar pt-0.5 whitespace-nowrap"></div>
+        </div>
+
+        <div id="answer-block" class="space-y-6 pt-2">
+          <div class="flex items-center justify-between gap-4">
+            <p id="answer-subtitle" class="text-xs text-inkFaint font-mono"></p>
+            <button type="button" id="subtitle-action-link" class="hidden text-xs font-mono text-inkMuted hover:text-ink underline underline-offset-4 shrink-0"></button>
+          </div>
+
+          <div id="answer-content" class="answer text-[16px] leading-[1.7] text-ink font-normal space-y-4"></div>
+
+          <div id="feedback" class="hidden pt-2 space-y-3">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-inkFaint">
+              <span>Accurate?</span>
+              <button type="button" id="fb-yes" class="text-inkMuted hover:text-ink transition-colors">Yes</button>
+              <span class="text-hairlineFocus">/</span>
+              <button type="button" id="fb-no" class="text-inkMuted hover:text-ink transition-colors">No</button>
+              <span id="fb-ack" class="hidden font-mono text-inkMuted"></span>
+              <a id="fb-view-golden" href="#golden" class="hidden font-mono text-xs text-ink hover:underline underline-offset-4">View in Golden Sets →</a>
+            </div>
+            <div id="fb-drawer" class="hidden pt-3 space-y-3 border-t border-hairlineSubtle">
+              <div id="fb-issues" class="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs">
+                <span class="text-inkFaint">Issue:</span>
+                <button type="button" data-issue="Wrong chunk" class="issue-tag">Wrong chunk</button>
+                <button type="button" data-issue="Parse leak" class="issue-tag">Parse leak</button>
+                <button type="button" data-issue="Incomplete" class="issue-tag">Incomplete</button>
+              </div>
+              <form id="fb-form" class="flex items-center border-b border-hairlineFocus pb-1.5">
+                <input id="fb-comment" type="text" autocomplete="off"
+                  placeholder="Optional note for the golden set (Enter to save)..."
+                  class="flex-1 min-w-0 bg-transparent text-xs text-ink placeholder-inkFaint focus:outline-none" />
+                <button type="submit" class="text-xs font-mono text-inkMuted hover:text-ink pl-3 shrink-0">Save to Golden Set ↵</button>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div id="sources-block" class="hidden pt-4 border-t border-hairline">
+          <div class="flex items-center justify-between pb-3">
+            <span class="text-xs font-mono uppercase tracking-wider text-inkFaint">Sources</span>
+            <span id="sources-count" class="text-xs font-mono text-inkFaint tabular-nums"></span>
+          </div>
+          <div id="sources-list" class="divide-y divide-hairlineSubtle"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Document viewer -->
+    <section class="w-full lg:w-[48%] lg:h-full bg-surface flex flex-col p-4 sm:p-6 lg:p-8 min-h-[70vh] lg:min-h-0 lg:overflow-hidden">
+      <div class="flex flex-wrap items-center justify-between gap-x-5 gap-y-2 pb-5 mb-2 border-b border-hairline shrink-0">
+        <span id="viewer-doc-title" class="font-mono text-xs text-ink truncate min-w-0">No source selected</span>
+        <div class="flex items-center space-x-4 sm:space-x-5 shrink-0 font-mono text-xs">
+          <span class="flex items-center space-x-2">
+            <button type="button" id="page-prev" class="text-inkFaint hover:text-ink disabled:opacity-30" aria-label="Previous page">‹</button>
+            <span id="viewer-page-indicator" class="text-inkFaint tabular-nums">—</span>
+            <button type="button" id="page-next" class="text-inkFaint hover:text-ink disabled:opacity-30" aria-label="Next page">›</button>
+          </span>
+          <button type="button" id="toggle-all-chunks-btn" class="text-inkFaint hover:text-ink transition-colors">All chunks: Off</button>
+          <button type="button" id="toggle-surface-btn" class="text-inkFaint hover:text-ink transition-colors">Surface: Image</button>
+        </div>
+      </div>
+
+      <div id="viewer-scroll" class="flex-1 overflow-y-auto flex justify-center items-start py-4">
+        <div id="viewer-empty" class="w-full max-w-[560px] border border-hairline p-10 text-center font-mono text-xs text-inkFaint">
+          The cited page appears here with the exact passage highlighted.
+        </div>
+        <article id="document-sheet" class="hidden w-full max-w-[560px] border transition-colors"></article>
+      </div>
+
+      <div class="pt-4 border-t border-hairline flex items-center justify-between gap-4 font-mono text-[11px] text-inkFaint shrink-0">
+        <span id="viewer-active-caption" class="truncate">No citation selected</span>
+        <span class="shrink-0 hidden sm:inline">Click any passage to focus</span>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================================================================ -->
+  <!-- VIEW 2: OVERVIEW                                                  -->
+  <!-- ================================================================ -->
+  <main id="view-overview" data-view="overview" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
+    <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
+      <div class="lock-slot"></div>
+      <div class="view-body space-y-16">
+        <section class="grid grid-cols-2 md:grid-cols-4 border-y border-hairline py-8 gap-y-8">
+          <a href="#ingestion" class="pr-4 md:pr-8 group">
+            <div class="flex items-center justify-between text-xs text-inkFaint mb-2 group-hover:text-inkMuted transition-colors"><span>Ingested Documents</span><span class="font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span></div>
+            <div id="metric-docs" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="metric-docs-sub" class="font-mono text-[11px] text-inkFaint mt-2 tabular-nums"></div>
+          </a>
+          <a href="#fidelity" class="pl-4 md:px-8 border-l border-hairline group">
+            <div class="flex items-center justify-between text-xs text-inkFaint mb-2 group-hover:text-inkMuted transition-colors"><span>Parse Success</span><span class="font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span></div>
+            <div id="metric-fidelity" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="metric-warnings-sub" class="font-mono text-[11px] text-inkFaint mt-2 tabular-nums"></div>
+          </a>
+          <a href="#golden" class="pr-4 md:px-8 md:border-l border-hairline group">
+            <div class="flex items-center justify-between text-xs text-inkFaint mb-2 group-hover:text-inkMuted transition-colors"><span>Golden Set Eval</span><span class="font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span></div>
+            <div id="metric-eval-pass" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="metric-eval-sub" class="font-mono text-[11px] text-inkFaint mt-2 tabular-nums"></div>
+          </a>
+          <a href="#ingestion" class="pl-4 md:pl-8 border-l border-hairline group">
+            <div class="flex items-center justify-between text-xs text-inkFaint mb-2 group-hover:text-inkMuted transition-colors"><span>Est. Spend</span><span class="font-mono opacity-0 group-hover:opacity-100 transition-opacity">→</span></div>
+            <div id="metric-spend" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="metric-spend-sub" class="font-mono text-[11px] text-inkFaint mt-2 tabular-nums">Waves 100 → 1k → 10k</div>
+          </a>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between gap-4">
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Red Flags · Parse Fidelity</h2>
+              <span id="overview-warnings-badge" class="text-xs font-mono tabular-nums whitespace-nowrap"></span>
+            </div>
+            <a href="#fidelity" class="text-xs font-mono text-inkMuted hover:text-ink transition-colors shrink-0">Open Fidelity Matrix →</a>
+          </div>
+          <div id="overview-warnings-list" class="border-t border-hairline divide-y divide-hairline"></div>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between gap-4">
+            <div class="flex items-center space-x-3 min-w-0">
+              <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint shrink-0">Recent Activity</h2>
+              <span id="overview-latest-wave" class="text-xs font-mono text-inkFaint tabular-nums truncate"></span>
+            </div>
+            <a href="#ingestion" class="text-xs font-mono text-inkMuted hover:text-ink transition-colors shrink-0">Full Ingestion Table →</a>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[640px] text-left border-collapse">
+              <thead>
+                <tr class="border-b border-hairline text-xs font-mono text-inkFaint">
+                  <th class="py-3.5 pr-6 font-normal">Document</th>
+                  <th class="py-3.5 px-4 font-normal">Type</th>
+                  <th class="py-3.5 px-4 font-normal">Engine</th>
+                  <th class="py-3.5 px-4 font-normal text-right">Pages</th>
+                  <th class="py-3.5 px-4 font-normal text-right">Chunks</th>
+                  <th class="py-3.5 pl-6 font-normal text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody id="overview-docs-tbody" class="divide-y divide-hairlineSubtle text-sm tabular-nums"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================================================================ -->
+  <!-- VIEW 3: INGESTION                                                 -->
+  <!-- ================================================================ -->
+  <main id="view-ingestion" data-view="ingestion" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
+    <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
+      <div class="lock-slot"></div>
+      <div class="view-body space-y-16">
+        <section class="flex flex-col sm:flex-row sm:items-end justify-between gap-6 border-b border-hairline pb-8">
+          <div class="space-y-2">
+            <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Pipeline Stage 01 · Ingestion</div>
+            <h1 class="text-2xl font-light tracking-tight text-ink">Measured Wave Ingestion</h1>
+            <p class="text-xs text-inkMuted max-w-xl leading-relaxed">
+              Documents parsed through Extend into the knowledge base in measured waves (<span class="font-mono text-ink">100 → 1k → 10k</span>) with automated dead-letter isolation.
+            </p>
+            <p id="ingest-error" class="hidden text-xs font-mono text-amberWarn"></p>
+          </div>
+          <div class="flex items-center space-x-4 shrink-0">
+            <input id="ingest-files" type="file" multiple class="hidden"
+              accept=".pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.png,.jpg,.jpeg,.tiff,.tif,.bmp,.txt,.md,.csv,.tsv,.html,.htm">
+            <button type="button" id="ingest-btn" class="px-4 py-2.5 bg-ink text-canvas text-xs font-mono font-medium hover:bg-inkMuted transition-colors disabled:opacity-60">+ Ingest Document</button>
+          </div>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Waves · 100 → 1k → 10k</h2>
+            <span id="ingestion-dl-count" class="text-xs font-mono text-inkFaint tabular-nums"></span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[720px] text-left border-collapse">
+              <thead>
+                <tr class="border-b border-hairline text-xs font-mono text-inkFaint">
+                  <th class="py-3 pr-6 font-normal">Wave ID</th>
+                  <th class="py-3 px-4 font-normal">Scale Tier</th>
+                  <th class="py-3 px-4 font-normal w-64">Progress</th>
+                  <th class="py-3 px-4 font-normal text-right">OK</th>
+                  <th class="py-3 px-4 font-normal text-right">Failed</th>
+                  <th class="py-3 px-4 font-normal text-right">Cost</th>
+                  <th class="py-3 pl-6 font-normal text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody id="ingestion-waves-tbody" class="divide-y divide-hairlineSubtle font-mono text-xs tabular-nums"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="dead-letter-section" class="hidden space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs font-mono uppercase tracking-wider text-amberWarn">Dead Letters</h2>
+            <span class="text-xs font-mono text-inkFaint">Failed after all retries · never dropped silently</span>
+          </div>
+          <div id="dead-letter-list" class="border-t border-hairline divide-y divide-hairline"></div>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Ingested Corpus Inventory</h2>
+            <span id="ingestion-inventory-meta" class="text-xs font-mono text-inkFaint tabular-nums"></span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[860px] text-left border-collapse">
+              <thead>
+                <tr class="border-b border-hairline text-xs font-mono text-inkFaint">
+                  <th class="py-3.5 pr-6 font-normal">Document</th>
+                  <th class="py-3.5 px-3 font-normal">Type</th>
+                  <th class="py-3.5 px-3 font-normal">Engine</th>
+                  <th class="py-3.5 px-3 font-normal text-right">Pages</th>
+                  <th class="py-3.5 px-3 font-normal text-right">Chunks</th>
+                  <th class="py-3.5 px-3 font-normal text-right">Tables</th>
+                  <th class="py-3.5 px-3 font-normal text-right">Empty</th>
+                  <th class="py-3.5 px-3 font-normal text-right">Cost</th>
+                  <th class="py-3.5 pl-6 font-normal text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody id="ingestion-full-tbody" class="divide-y divide-hairlineSubtle text-xs font-mono tabular-nums"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================================================================ -->
+  <!-- VIEW 4: PARSE FIDELITY                                            -->
+  <!-- ================================================================ -->
+  <main id="view-fidelity" data-view="fidelity" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
+    <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
+      <div class="lock-slot"></div>
+      <div class="view-body space-y-16">
+        <section class="flex flex-col sm:flex-row sm:items-end justify-between gap-6 border-b border-hairline pb-8">
+          <div class="space-y-2">
+            <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Pipeline Stage 02 · Parse Fidelity</div>
+            <h1 class="text-2xl font-light tracking-tight text-ink">Fidelity Diagnostics &amp; Anomaly Triage</h1>
+            <p class="text-xs text-inkMuted max-w-xl leading-relaxed">
+              Structural checks computed at ingest: table geometry, page numbers leaking into body text, and how much of the source text the parse recovered.
+            </p>
+            <p id="reparse-all-error" class="hidden text-xs font-mono text-amberWarn"></p>
+          </div>
+          <div class="flex items-center space-x-4 shrink-0">
+            <button type="button" id="reparse-all-cancel" class="hidden text-xs text-inkFaint hover:text-ink">Cancel</button>
+            <button type="button" id="reparse-all-btn" class="px-4 py-2.5 bg-ink text-canvas text-xs font-mono font-medium hover:bg-inkMuted transition-colors disabled:opacity-50">Re-parse All Flagged (Performance)</button>
+          </div>
+        </section>
+
+        <section class="grid grid-cols-1 md:grid-cols-3 border-b border-hairline pb-8 divide-y md:divide-y-0 md:divide-x divide-hairline gap-6 md:gap-0">
+          <div class="md:pr-8">
+            <div class="text-xs text-inkFaint mb-2">Table Shape Consistency</div>
+            <div id="fid-metric-table" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="fid-metric-table-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+          <div class="md:px-8 pt-6 md:pt-0">
+            <div class="text-xs text-inkFaint mb-2">Page Number Leaks</div>
+            <div id="fid-metric-leak" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div class="font-mono text-[11px] text-inkFaint mt-2">Chunks with a page number in body text</div>
+          </div>
+          <div class="md:pl-8 pt-6 md:pt-0">
+            <div class="text-xs text-inkFaint mb-2">Mean Source Coverage</div>
+            <div id="fid-metric-coverage" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="fid-metric-coverage-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Per-Document Fidelity Matrix</h2>
+            <span class="text-xs font-mono text-inkFaint">Click a document to inspect and re-parse</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[720px] text-left border-collapse">
+              <thead>
+                <tr class="border-b border-hairline text-xs font-mono text-inkFaint">
+                  <th class="py-3.5 pr-6 font-normal">Document</th>
+                  <th class="py-3.5 px-4 font-normal">Engine</th>
+                  <th class="py-3.5 px-4 font-normal text-right">Table Shape</th>
+                  <th class="py-3.5 px-4 font-normal text-right">Page Leaks</th>
+                  <th class="py-3.5 px-4 font-normal text-right">Text Coverage</th>
+                  <th class="py-3.5 pl-6 font-normal text-right">Diagnostic Action</th>
+                </tr>
+              </thead>
+              <tbody id="fidelity-matrix-tbody" class="divide-y divide-hairlineSubtle font-mono text-xs tabular-nums"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================================================================ -->
+  <!-- VIEW 5: GOLDEN SETS                                               -->
+  <!-- ================================================================ -->
+  <main id="view-golden" data-view="golden" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
+    <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
+      <div class="lock-slot"></div>
+      <div class="view-body space-y-16">
+        <section class="flex flex-col sm:flex-row sm:items-end justify-between gap-6 border-b border-hairline pb-8">
+          <div class="space-y-2">
+            <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Pipeline Stage 03 · Golden Sets</div>
+            <h1 class="text-2xl font-light tracking-tight text-ink">Evaluation Assertions &amp; Regression Suite</h1>
+            <p class="text-xs text-inkMuted max-w-xl leading-relaxed">
+              Golden sets assert retrieval accuracy and parse integrity. Rating answers in the <a href="#qa" class="text-ink underline underline-offset-4">Q&amp;A workspace</a> adds new assertions here.
+            </p>
+          </div>
+          <div class="flex items-center space-x-4 shrink-0">
+            <button type="button" id="run-suite-btn" class="px-4 py-2.5 bg-ink text-canvas text-xs font-mono font-medium hover:bg-inkMuted transition-colors disabled:opacity-60">Run Golden Suite</button>
+          </div>
+        </section>
+
+        <section class="grid grid-cols-2 md:grid-cols-4 border-b border-hairline pb-8 gap-y-8">
+          <div class="pr-4 md:pr-8">
+            <div class="text-xs text-inkFaint mb-2">Total Assertions</div>
+            <div id="golden-total-count" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="golden-total-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+          <div class="pl-4 md:px-8 border-l border-hairline">
+            <div class="text-xs text-inkFaint mb-2">Pass Rate</div>
+            <div id="golden-pass-rate" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="golden-pass-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+          <div class="pr-4 md:px-8 md:border-l border-hairline">
+            <div class="text-xs text-inkFaint mb-2">Last Suite Run</div>
+            <div id="golden-last-run" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="golden-last-run-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+          <div class="pl-4 md:pl-8 border-l border-hairline">
+            <div class="text-xs text-inkFaint mb-2">Retrieval Hit@5</div>
+            <div id="golden-hit" class="font-mono text-3xl font-light text-ink tabular-nums">—</div>
+            <div id="golden-hit-sub" class="font-mono text-[11px] text-inkFaint mt-2"></div>
+          </div>
+        </section>
+
+        <section class="space-y-4">
+          <div class="flex items-center justify-between gap-4">
+            <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Golden Set Test Cases</h2>
+            <a href="#qa" class="text-xs font-mono text-inkMuted hover:text-ink transition-colors shrink-0">+ Add Assertion from Q&amp;A →</a>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full min-w-[760px] table-fixed text-left border-collapse">
+              <colgroup><col class="w-[30%]"><col class="w-[22%]"><col class="w-[20%]"><col class="w-[18%]"><col class="w-[10%]"></colgroup>
+              <thead>
+                <tr class="border-b border-hairline text-xs font-mono text-inkFaint">
+                  <th class="py-3.5 pr-6 font-normal">Query / Assertion</th>
+                  <th class="py-3.5 px-4 font-normal">Expected</th>
+                  <th class="py-3.5 px-4 font-normal">Retrieved</th>
+                  <th class="py-3.5 px-4 font-normal">Evaluator Note</th>
+                  <th class="py-3.5 pl-6 font-normal text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody id="golden-assertions-tbody" class="divide-y divide-hairlineSubtle text-xs font-mono tabular-nums"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================================================================ -->
+  <!-- SLIDE-OVER: fidelity inspection + Performance re-parse            -->
+  <!-- ================================================================ -->
+  <div id="diff-sheet-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 flex justify-end">
+    <div role="dialog" aria-modal="true" aria-labelledby="diff-doc-title"
+      class="w-full max-w-2xl bg-canvas border-l border-hairline h-full flex flex-col justify-between p-6 sm:p-8 lg:p-12 overflow-y-auto">
+      <div class="space-y-6">
+        <div class="flex items-start justify-between gap-4 pb-6 border-b border-hairline">
+          <div class="space-y-1 min-w-0">
+            <span class="text-xs font-mono uppercase tracking-wider text-inkFaint">Parse Fidelity Inspection</span>
+            <h3 id="diff-doc-title" class="font-mono text-sm text-ink break-all"></h3>
+          </div>
+          <button type="button" id="diff-close" class="text-xs font-mono text-inkFaint hover:text-ink shrink-0">Close [Esc]</button>
+        </div>
+        <p id="diff-issue-summary" class="text-sm text-inkMuted leading-relaxed"></p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+          <div class="space-y-2 min-w-0">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span id="diff-left-label" class="text-inkFaint">Current</span>
+              <span id="diff-left-status"></span>
+            </div>
+            <div id="diff-left" class="p-5 bg-surface border border-hairline font-mono text-xs text-inkMuted leading-relaxed space-y-3"></div>
+          </div>
+          <div class="space-y-2 min-w-0">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span id="diff-right-label" class="text-inkFaint">Performance Engine</span>
+              <span id="diff-right-status"></span>
+            </div>
+            <div id="diff-right" class="p-5 bg-surface border border-hairline font-mono text-xs text-inkMuted leading-relaxed space-y-3"></div>
+          </div>
+        </div>
+      </div>
+      <div class="pt-8 mt-8 border-t border-hairline flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <span id="diff-cost" class="font-mono text-xs text-inkFaint"></span>
+        <div class="flex items-center justify-end space-x-6">
+          <button type="button" id="diff-cancel" class="text-xs text-inkFaint hover:text-ink">Cancel</button>
+          <button type="button" id="diff-reparse" class="whitespace-nowrap px-5 py-2.5 bg-ink text-canvas text-xs font-medium hover:bg-inkMuted transition-colors disabled:opacity-50">Re-parse with Performance Engine</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <template id="lock-template">
+    <section class="max-w-md space-y-6 py-10">
+      <div class="space-y-2">
+        <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Console locked</div>
+        <h1 class="text-2xl font-light tracking-tight text-ink lock-title">Enter the access code</h1>
+        <p class="text-xs text-inkMuted leading-relaxed">Overview, Ingestion, Parse Fidelity and Golden Sets need the console access code. Q&amp;A stays open to everyone.</p>
+      </div>
+      <form class="lock-form flex items-center border-b border-hairlineFocus focus-within:border-ink transition-colors pb-2">
+        <input type="password" name="code" autocomplete="current-password" placeholder="Access code"
+          class="flex-1 min-w-0 bg-transparent text-base text-ink placeholder-inkFaint focus:outline-none pr-4" required>
+        <button type="submit" class="text-xs font-mono text-inkMuted hover:text-ink shrink-0">Unlock ↵</button>
+      </form>
+      <p class="lock-error hidden text-xs font-mono text-amberWarn"></p>
+    </section>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

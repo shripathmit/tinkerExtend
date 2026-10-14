@@ -185,3 +185,105 @@ def compare_modes(kb: KnowledgeBase, cases: list[EvalCase], embedder,
         "hybrid": summary(embedder) if embedder is not None and embedder.model else None,
         "model": getattr(embedder, "model", None),
     }
+
+
+def _where(hit: dict | None) -> str:
+    """'file.pdf · p.4' for a search hit, '—' for none."""
+    if not hit:
+        return "—"
+    try:
+        pages = json.loads(hit.get("pages_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        pages = []
+    name = (hit.get("doc_source") or "").split("/")[-1]
+    return f"{name} · p.{pages[0]}" if pages else name
+
+
+def golden_assertions(kb: KnowledgeBase, cases: list[EvalCase], doc_checks: list[dict],
+                      feedback: list[dict], embedder=None, k: int = 5) -> dict:
+    """Every golden assertion as one row with a PASS/FAIL/RESOLVED status.
+
+    Three sources:
+      - golden Q&A cases: relevant passage in top-k, expected facts in the
+        answer; unanswerable cases must be declined.
+      - golden-doc probes (``doc_checks`` = check_golden_doc results, or
+        ``{"doc", "status": "not_ingested"}``): each fact present in the parse.
+      - Q&A feedback: a thumbs-up asserts the rated chunk is still retrieved
+        in the top k for that question; a thumbs-down fails until resolved.
+    """
+    rows: list[dict] = []
+    for case in cases:
+        hits = retrieve(case.question, kb, embedder=embedder, limit=k)
+        result = ask(case.question, kb, llm=None, limit=k, embedder=embedder)
+        if not case.answerable:
+            declined = result.get("mode") == "none"
+            rows.append({
+                "source": "golden_qa", "query": case.question,
+                "expected": "Declines (unanswerable)",
+                "retrieved": "Declined" if declined else _where(hits[0] if hits else None),
+                "note": "Must not answer from unrelated passages",
+                "status": "PASS" if declined else "FAIL"})
+            continue
+        rank = next((i for i, h in enumerate(hits, start=1)
+                     if _contains_any(h["content"], case.relevant_contains)), None)
+        answer = (result.get("answer") or "").lower()
+        found = [f for f in case.answer_contains if f.lower() in answer]
+        ok = rank is not None and len(found) == len(case.answer_contains)
+        rows.append({
+            "source": "golden_qa", "query": case.question,
+            "expected": " | ".join(case.relevant_contains),
+            "retrieved": (f"{_where(hits[rank - 1])} [rank {rank}]" if rank
+                          else f"Not in top {k}" + (f" (top: {_where(hits[0])})" if hits else "")),
+            "note": f"Facts {len(found)}/{len(case.answer_contains)} in answer",
+            "status": "PASS" if ok else "FAIL"})
+
+    for check in doc_checks:
+        if check.get("status") == "not_ingested":
+            rows.append({"source": "golden_doc", "query": f"Parse of {check.get('doc', '')}",
+                         "expected": "Document ingested", "retrieved": "Not ingested",
+                         "note": "Ingest the golden document to run its probes",
+                         "status": "FAIL"})
+            continue
+        for probe in check.get("probes", []):
+            rows.append({
+                "source": "golden_doc", "query": probe["fact"],
+                "expected": f"In parse of {check.get('doc', '')}",
+                "retrieved": "Found" if probe["passed"] else "Missing: " + ", ".join(probe["missing"]),
+                "note": "Parse fidelity probe",
+                "status": "PASS" if probe["passed"] else "FAIL"})
+
+    for fb in feedback:
+        try:
+            chunk_ids = json.loads(fb.get("chunk_ids") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            chunk_ids = []
+        target = fb.get("active_chunk_id") or (chunk_ids[0] if chunk_ids else "")
+        base = {"source": "feedback", "id": fb["id"], "query": fb["question"],
+                "created_at": fb.get("created_at", "")}
+        if fb["rating"] < 0:
+            note = fb.get("issue") or "Marked inaccurate"
+            if fb.get("comment"):
+                note += f": {fb['comment']}"
+            rows.append({**base, "expected": f"Fix for chunk {target or '—'}",
+                         "retrieved": "Flagged in Q&A", "note": note,
+                         "status": "RESOLVED" if fb.get("resolved") else "FAIL"})
+            continue
+        hits = retrieve(fb["question"], kb, embedder=embedder, limit=k)
+        rank = next((i for i, h in enumerate(hits, start=1) if h["chunk_id"] == target), None)
+        exists = bool(target) and kb.conn.execute(
+            "SELECT 1 FROM chunks WHERE chunk_id = ?", (target,)).fetchone() is not None
+        rows.append({**base, "expected": f"Chunk {target or '—'} in top {k}",
+                     "retrieved": (f"Rank {rank}" if rank else
+                                   "Chunk no longer exists" if not exists else f"Not in top {k}"),
+                     "note": "Verified accurate in Q&A",
+                     "status": "PASS" if rank else "FAIL"})
+
+    counted = [r for r in rows if r["status"] != "RESOLVED"]
+    passed = sum(1 for r in counted if r["status"] == "PASS")
+    return {
+        "rows": rows,
+        "total": len(counted),
+        "passed": passed,
+        "failed": len(counted) - passed,
+        "pass_rate": passed / len(counted) if counted else 1.0,
+    }

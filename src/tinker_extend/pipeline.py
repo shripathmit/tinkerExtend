@@ -199,7 +199,12 @@ class WaveIngester:
         max_attempts: int = 3,
         backoff_s: float = 2.0,
         embedder: Embedder | None = None,
+        force: bool = False,
+        engine_override: str | None = None,
     ):
+        """force: re-parse files already in the KB (same doc_id, chunks and
+        telemetry replaced, before/after kept in reparse_history).
+        engine_override: use this parse engine instead of the doc-type profile."""
         self.client_factory = client_factory
         self.kb_path = kb_path
         self.workers = workers
@@ -207,6 +212,8 @@ class WaveIngester:
         self.max_attempts = max_attempts
         self.backoff_s = backoff_s
         self.embedder = embedder or NullEmbedder()
+        self.force = force
+        self.engine_override = engine_override
         self._lock = threading.Lock()
         self.progress = {"done": 0, "failed": 0, "skipped": 0, "total": 0}
 
@@ -242,11 +249,14 @@ class WaveIngester:
         started = time.monotonic()
         try:
             file_hash = sha256_file(path)
+            before = None
             if kb.has_hash(file_hash):
-                self._bump("skipped")
-                return {"source": path, "status": "skipped"}
+                if not self.force:
+                    self._bump("skipped")
+                    return {"source": path, "status": "skipped"}
+                before = kb.telemetry_row(file_hash)
             pre_type, _, _ = classify_filename(os.path.basename(path))
-            engine = self.profiles.get(pre_type, "parse_light")
+            engine = self.engine_override or self.profiles.get(pre_type, "parse_light")
             extend_file_id, run = self._parse_with_retry(client, path, engine)
             doc = pipe._store_run(file_hash, path, file_hash, extend_file_id, run)
             # Blocks live per-chunk (run["output"]["chunks"][i]["blocks"]),
@@ -274,6 +284,9 @@ class WaveIngester:
             duration = time.monotonic() - started
             kb.record_telemetry(doc.doc_id, wave, doc_type, engine, metrics,
                                 cost, duration, status="ok")
+            if self.force:
+                kb.add_reparse_history(doc.doc_id, engine, before or {},
+                                       kb.telemetry_row(doc.doc_id) or {}, cost)
             self._bump("done")
             return {"source": path, "status": "ok", "doc_id": doc.doc_id,
                     "doc_type": doc_type, "engine": engine,

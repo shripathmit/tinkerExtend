@@ -76,28 +76,44 @@ python -m tinker_extend.cli --db ./kb.sqlite3 eval --eval-file eval/golden_10q.j
 python -m tinker_extend.cli query "How much did R&D spending fall?" --keyword-only
 ```
 
-## Web UI — search and Q&A
+## Web app — one UI, five tabs
 
 ```bash
 uvicorn --app-dir src tinker_extend.web:app --host 0.0.0.0 --port 8000
 ```
 
-Open the page, type a question, and hit **Ask** (grounded Q&A with citations)
-or **Search** (raw full-text matches). Answers are extractive by default —
-the top passages, no hallucination. Set `TINKER_LLM_API_KEY` (plus optional
-`TINKER_LLM_BASE_URL` / `TINKER_LLM_MODEL`) to get generated answers from any
-OpenAI-compatible chat endpoint, still grounded and cited.
+| Tab | Access | What it does |
+|---|---|---|
+| **Q&A** | public | Ask (grounded answer with citations) or Search. The viewer shows the real page with the cited region boxed; *Surface* switches to a text reader (dark or paper), *All chunks* outlines every chunk on the page. *Accurate? Yes/No* turns the answer into a golden assertion. |
+| **Overview** | code | Documents, parse success, golden pass rate, spend; red flags with *Inspect & Fix*. |
+| **Ingestion** | code | *+ Ingest Document* uploads files and runs a wave with live progress; waves by scale tier; corpus inventory; dead letters (retry/resolve). |
+| **Parse Fidelity** | code | Table shape, page-number leaks, text coverage per document. *Inspect* shows the problem passages and re-parses with Extend's Performance engine (spends credits, ~$0.025/page), then shows before → after. |
+| **Golden Sets** | code | Every assertion with live PASS/FAIL: the golden Q&A file, golden-doc probes, and Q&A feedback (thumbs-up: the same chunk must stay in the top 5; thumbs-down: FAIL until resolved). |
 
-## Admin console
+The header's **LLM** switch picks extractive or generated answers. Generated
+answers need `TINKER_LLM_API_KEY` (plus optional `TINKER_LLM_BASE_URL` /
+`TINKER_LLM_MODEL`, any OpenAI-compatible endpoint); without it answers are
+extractive — the best passage, quoted.
 
-`/admin` shows ingestion waves, parse fidelity, golden sets and the
-dead-letter queue. It asks for an access code (default `extend`; set
+The console tabs ask for the access code once (default `extend`; set
 `TINKER_ADMIN_CODE` to change it). Every `/api/admin/*` endpoint needs the
-console session cookie or an `X-Admin-Code` header:
+session cookie or an `X-Admin-Code` header:
 
 ```bash
 curl -H "X-Admin-Code: $TINKER_ADMIN_CODE" https://<host>/api/admin/overview
 ```
+
+The UI is static (`src/tinker_extend/static/`: `index.html`, `app.js`, and a
+compiled Tailwind `app.css`), so the server needs no Node. After editing the
+markup or classes, rebuild the CSS:
+
+```bash
+npx tailwindcss@3.4.17 -c src/tinker_extend/static/tailwind.config.js \
+  -i src/tinker_extend/static/src/input.css -o src/tinker_extend/static/app.css --minify
+```
+
+Re-parse needs the original file on the server (its stored path, the seed
+dir, or `TINKER_UPLOAD_DIR`), verified by content hash.
 
 Deploy: `Procfile` + `railway.json` are included. On first boot the app seeds
 itself from `./seed_docs` if the KB is empty and `EXTEND_API_KEY` is set.

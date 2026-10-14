@@ -63,6 +63,17 @@ the top passages, no hallucination. Set `TINKER_LLM_API_KEY` (plus optional
 `TINKER_LLM_BASE_URL` / `TINKER_LLM_MODEL`) to get generated answers from any
 OpenAI-compatible chat endpoint, still grounded and cited.
 
+## Admin console
+
+`/admin` shows ingestion waves, parse fidelity, golden sets and the
+dead-letter queue. It asks for an access code (default `extend`; set
+`TINKER_ADMIN_CODE` to change it). Every `/api/admin/*` endpoint needs the
+console session cookie or an `X-Admin-Code` header:
+
+```bash
+curl -H "X-Admin-Code: $TINKER_ADMIN_CODE" https://<host>/api/admin/overview
+```
+
 Deploy: `Procfile` + `railway.json` are included. On first boot the app seeds
 itself from `./seed_docs` if the KB is empty and `EXTEND_API_KEY` is set.
 

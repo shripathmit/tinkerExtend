@@ -18,7 +18,7 @@ Rules:
 
 
 def _passage_block(i: int, p: dict) -> str:
-    return f"[{i}] (source: {p['doc_source']}, pages {p['pages_json']})\n{p['content']}"
+    return f"[{i}] (source: {p['doc_source']}, pages {p['pages']})\n{p['content']}"
 
 
 def ask(question: str, kb: KnowledgeBase, llm: LLMClient | None = None,

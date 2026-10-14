@@ -6,14 +6,16 @@ needed to see what is actually happening in the pipeline.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import shutil
 import threading
 import time
 
-from fastapi import APIRouter, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .config import load_config
 from .extend_client import ExtendClient
@@ -22,12 +24,42 @@ from .ingest import SUPPORTED_EXTENSIONS, iter_candidate_files, sha256_file
 from .pipeline import WaveIngester
 from .store import KnowledgeBase
 
+# Page routes (/admin, login, logout) are public; every /api/admin route is
+# registered on _api, which requires the admin code. _api is mounted onto
+# router at the bottom of this module, after all its routes exist.
 router = APIRouter()
 
 KB_PATH = os.environ.get("TINKER_KB_PATH", "./kb.sqlite3")
 SEED_DIR = os.environ.get("TINKER_SEED_DIR", "./seed_docs")
 UPLOAD_DIR = os.environ.get("TINKER_UPLOAD_DIR", "./uploads")
 MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # per file
+
+# Shared access code for the admin console. Override in production.
+ADMIN_CODE = os.environ.get("TINKER_ADMIN_CODE", "extend")
+ADMIN_COOKIE = "tinker_admin"
+ADMIN_COOKIE_MAX_AGE = 7 * 24 * 3600
+
+
+def _session_token() -> str:
+    """Cookie value: an HMAC of the code, so the code itself never sits in the cookie."""
+    return hmac.new(ADMIN_CODE.encode(), b"tinker-admin-session",
+                    hashlib.sha256).hexdigest()
+
+
+def is_admin(request: Request) -> bool:
+    """Signed-in via the console cookie, or an X-Admin-Code header (scripts)."""
+    cookie = request.cookies.get(ADMIN_COOKIE, "")
+    header = request.headers.get("x-admin-code", "")
+    return (hmac.compare_digest(cookie, _session_token())
+            or hmac.compare_digest(header, ADMIN_CODE))
+
+
+def require_admin(request: Request) -> None:
+    if not is_admin(request):
+        raise HTTPException(status_code=401, detail="admin code required")
+
+
+_api = APIRouter(dependencies=[Depends(require_admin)])
 
 
 def _resolve_eval_file(env_key: str, default: str) -> str:
@@ -101,7 +133,7 @@ def _run_wave_job(wave: str, paths: list[str], workers: int) -> None:
             JOBS[wave]["status"] = f"failed: {exc}"
 
 
-@router.get("/api/admin/overview")
+@_api.get("/api/admin/overview")
 def api_overview():
     kb = _kb()
     try:
@@ -121,7 +153,7 @@ def api_overview():
         kb.close()
 
 
-@router.get("/api/admin/telemetry")
+@_api.get("/api/admin/telemetry")
 def api_telemetry(limit: int = 100):
     kb = _kb()
     try:
@@ -134,7 +166,7 @@ def api_telemetry(limit: int = 100):
         kb.close()
 
 
-@router.get("/api/admin/fidelity")
+@_api.get("/api/admin/fidelity")
 def api_fidelity():
     kb = _kb()
     try:
@@ -150,7 +182,7 @@ def api_fidelity():
         kb.close()
 
 
-@router.get("/api/admin/golden_docs")
+@_api.get("/api/admin/golden_docs")
 def api_golden_docs():
     if not os.path.exists(GOLDEN_DOCS):
         return {"specs": [], "note": "no golden docs defined yet"}
@@ -189,7 +221,7 @@ def api_golden_docs():
         kb.close()
 
 
-@router.get("/api/admin/golden_qa")
+@_api.get("/api/admin/golden_qa")
 def api_golden_qa():
     from .eval import eval_answers, eval_retrieval, load_eval_set
     if not os.path.exists(GOLDEN_QA):
@@ -206,7 +238,7 @@ def api_golden_qa():
         kb.close()
 
 
-@router.get("/api/admin/dead_letters")
+@_api.get("/api/admin/dead_letters")
 def api_dead_letters():
     kb = _kb()
     try:
@@ -215,7 +247,7 @@ def api_dead_letters():
         kb.close()
 
 
-@router.post("/api/admin/dead_letters/{dl_id}/resolve")
+@_api.post("/api/admin/dead_letters/{dl_id}/resolve")
 def api_dl_resolve(dl_id: int):
     kb = _kb()
     try:
@@ -225,7 +257,7 @@ def api_dl_resolve(dl_id: int):
         kb.close()
 
 
-@router.post("/api/admin/dead_letters/{dl_id}/retry")
+@_api.post("/api/admin/dead_letters/{dl_id}/retry")
 def api_dl_retry(dl_id: int):
     kb = _kb()
     try:
@@ -244,7 +276,7 @@ def api_dl_retry(dl_id: int):
     return {"ok": True, "wave": wave}
 
 
-@router.post("/api/admin/upload")
+@_api.post("/api/admin/upload")
 async def api_upload(files: list[UploadFile] = File(...)):
     """Upload documents from the operator's machine into the upload dir.
 
@@ -289,7 +321,7 @@ async def api_upload(files: list[UploadFile] = File(...)):
             "saved": saved, "skipped": skipped}
 
 
-@router.get("/api/admin/uploads")
+@_api.get("/api/admin/uploads")
 def api_uploads():
     if not os.path.isdir(UPLOAD_DIR):
         return {"dir": os.path.abspath(UPLOAD_DIR), "files": []}
@@ -333,7 +365,7 @@ def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:
             "flags": red_flags(metrics)}
 
 
-@router.post("/api/admin/telemetry/recompute")
+@_api.post("/api/admin/telemetry/recompute")
 def api_telemetry_recompute(payload: dict):
     doc_id = (payload or {}).get("doc_id")
     kb = _kb()
@@ -353,7 +385,7 @@ def api_telemetry_recompute(payload: dict):
         kb.close()
 
 
-@router.post("/api/admin/waves")
+@_api.post("/api/admin/waves")
 def api_start_wave(payload: dict):
     try:
         _client_factory()
@@ -382,15 +414,69 @@ def api_start_wave(payload: dict):
     return {"ok": True, "wave": wave, "files": len(paths)}
 
 
-@router.get("/api/admin/jobs")
+@_api.get("/api/admin/jobs")
 def api_jobs():
     with _JOBS_LOCK:
         return {"jobs": dict(JOBS)}
 
 
 @router.get("/admin", response_class=HTMLResponse)
-def admin_index():
+def admin_index(request: Request):
+    if not is_admin(request):
+        return HTMLResponse(_login_page())
     return ADMIN_PAGE
+
+
+@router.post("/admin/login")
+def admin_login(code: str = Form("")):
+    if not hmac.compare_digest(code.strip(), ADMIN_CODE):
+        return HTMLResponse(_login_page("Wrong code."), status_code=401)
+    resp = RedirectResponse("/admin", status_code=303)
+    resp.set_cookie(ADMIN_COOKIE, _session_token(), max_age=ADMIN_COOKIE_MAX_AGE,
+                    httponly=True, samesite="lax")
+    return resp
+
+
+@router.get("/admin/logout")
+def admin_logout():
+    resp = RedirectResponse("/admin", status_code=303)
+    resp.delete_cookie(ADMIN_COOKIE)
+    return resp
+
+
+def _login_page(error: str = "") -> str:
+    err = f'<p class="err">{error}</p>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinkerExtend Console</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font-family: -apple-system, "Segoe UI", Inter, sans-serif;
+         background: #0a0c10; color: #e8ecf1; }}
+  form {{ width: min(320px, calc(100vw - 32px)); background: #0d1015;
+         border: 1px solid #1c222b; border-radius: 10px; padding: 24px; }}
+  h1 {{ font-size: 18px; margin: 0 0 16px; }}
+  input, button {{ width: 100%; box-sizing: border-box; padding: 10px;
+                  border-radius: 6px; font-size: 14px; }}
+  input {{ background: #0a0c10; color: #e8ecf1; border: 1px solid #2a323d;
+          margin-bottom: 12px; }}
+  button {{ background: #3b82f6; color: #fff; border: 0; cursor: pointer; }}
+  .err {{ color: #f87171; font-size: 13px; margin: 0 0 12px; }}
+</style>
+</head>
+<body>
+<form method="post" action="/admin/login">
+  <h1>tinkerExtend console</h1>
+  {err}
+  <input type="password" name="code" placeholder="Access code" autofocus required>
+  <button type="submit">Enter</button>
+</form>
+</body>
+</html>"""
 
 
 ADMIN_PAGE = """<!DOCTYPE html>
@@ -499,7 +585,7 @@ ADMIN_PAGE = """<!DOCTYPE html>
   <a class="item" data-tab="fidelity">Parse Fidelity</a>
   <a class="item" data-tab="golden">Golden Sets</a>
   <a class="item" data-tab="dead">Dead Letter <span id="dlBadge"></span></a>
-  <div class="foot"><a href="/">← Q&amp;A app</a></div>
+  <div class="foot"><a href="/">← Q&amp;A app</a> · <a href="/admin/logout">Sign out</a></div>
 </nav>
 <main>
   <div class="topbar">
@@ -592,6 +678,7 @@ function waveBar(done, total){
 
 async function api(path, opts){
   const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = '/admin'; throw new Error('signed out'); }
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
@@ -793,3 +880,7 @@ loadOverview();
 </body>
 </html>
 """
+
+
+# Mount the protected API routes (must run after they are all defined).
+router.include_router(_api)

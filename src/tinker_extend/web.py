@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .admin import router as admin_router
 from .classify import classify_content
 from .config import load_config
@@ -172,7 +173,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="tinkerExtend Q&A", lifespan=lifespan)
-APP_VERSION = "0.6.0"  # admin console: Phase 0/1 visibility
+APP_VERSION = __version__
 os.makedirs(PAGE_IMG_DIR, exist_ok=True)
 app.mount("/page_images", StaticFiles(directory=PAGE_IMG_DIR), name="page_images")
 app.include_router(admin_router)

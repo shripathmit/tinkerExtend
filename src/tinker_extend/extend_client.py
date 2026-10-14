@@ -17,6 +17,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from . import __version__
+
 
 class ExtendAPIError(RuntimeError):
     """An HTTP-level API error."""
@@ -72,7 +74,7 @@ class ExtendClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "x-extend-api-version": self.api_version,
-            "User-Agent": "tinker-extend/0.1",
+            "User-Agent": f"tinker-extend/{__version__}",
         }
         if content_type:
             headers["Content-Type"] = content_type

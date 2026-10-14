@@ -11,19 +11,25 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def block_page_number(b) -> int | None:
+    """Page number of one layout block, or None.
+
+    Real Extend blocks nest the page under metadata.page.number; keep the
+    flat fallbacks for older/other shapes. Shared by chunking and fidelity
+    so both count pages the same way.
+    """
+    if not isinstance(b, dict):
+        return None
+    meta_page = (b.get("metadata") or {}).get("page") or {}
+    for c in (meta_page.get("number"), b.get("page"),
+              b.get("pageNumber"), b.get("page_number")):
+        if isinstance(c, int):
+            return c
+    return None
+
+
 def _pages_from_blocks(blocks: list) -> list[int]:
-    pages: list[int] = []
-    for b in blocks:
-        if not isinstance(b, dict):
-            continue
-        # Real Extend blocks nest the page under metadata.page.number;
-        # keep the flat fallbacks for older/other shapes.
-        meta_page = (b.get("metadata") or {}).get("page") or {}
-        candidates = [meta_page.get("number"), b.get("page"),
-                      b.get("pageNumber"), b.get("page_number")]
-        for c in candidates:
-            if isinstance(c, int) and c not in pages:
-                pages.append(c)
+    pages = {p for p in map(block_page_number, blocks) if p is not None}
     return sorted(pages)
 
 

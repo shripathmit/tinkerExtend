@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import re
 
+from .chunking import block_page_number
+
 _REPLACEMENT = "\ufffd"
 _LONG_TOKEN_RE = re.compile(r"\S{60,}")
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
@@ -106,8 +108,8 @@ def fidelity_metrics(blocks: list[dict], chunks: list[str]) -> dict:
         if not isinstance(b, dict):
             continue
         meta = b.get("metadata") or {}
-        page = (meta.get("page") or {}).get("number")
-        if isinstance(page, int):
+        page = block_page_number(b)
+        if page is not None:
             pages.add(page)
         conf = meta.get("avgOcrConfidence")
         if isinstance(conf, (int, float)):

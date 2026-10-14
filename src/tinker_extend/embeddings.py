@@ -30,10 +30,6 @@ def to_blob(vec) -> bytes:
     return normalize(vec).tobytes()
 
 
-def from_blob(blob: bytes) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32)
-
-
 class Embedder:
     """Interface: embed passages and queries into normalized float32 vectors.
 

@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from .config import load_config
 from .embeddings import embedder_from_env
 from .extend_client import ExtendClient
-from .chunking import TAG_STRIP_RE, block_page_number
+from .chunking import TAG_STRIP_RE
 from .fidelity import (
     _is_garbled, _table_shape_ok, check_golden_doc, fidelity_checks,
     fidelity_metrics, fidelity_verdict, load_golden_docs, red_flags, table_grid,

@@ -66,7 +66,6 @@ CREATE TABLE IF NOT EXISTS chunks (
   blocks_json    TEXT NOT NULL DEFAULT '[]',
   pages_json     TEXT NOT NULL DEFAULT '[]',
   token_estimate INTEGER NOT NULL DEFAULT 0,
-  embedding_json TEXT,           -- legacy, unused
   embedding      BLOB,           -- normalized float32 vector
   embedding_model TEXT
 );
@@ -155,6 +154,10 @@ class KnowledgeBase:
         for name, decl in (("embedding", "BLOB"), ("embedding_model", "TEXT")):
             if name not in ccols:
                 self.conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {decl}")
+        if "embedding_json" in ccols:
+            # Legacy column from the embedding_json era; vectors now live in
+            # the embedding BLOB. Drop it on existing databases.
+            self.conn.execute("ALTER TABLE chunks DROP COLUMN embedding_json")
         fcols = {r[1] for r in self.conn.execute("PRAGMA table_info(feedback)")}
         for name, decl in (("issue", "TEXT NOT NULL DEFAULT ''"),
                            ("active_chunk_id", "TEXT NOT NULL DEFAULT ''"),

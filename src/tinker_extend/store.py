@@ -132,6 +132,15 @@ CREATE TABLE IF NOT EXISTS reparse_history (
   cost_usd    REAL NOT NULL DEFAULT 0,
   at          TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS provider_runs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at     TEXT NOT NULL,
+  filename       TEXT NOT NULL DEFAULT '',
+  file_path      TEXT NOT NULL DEFAULT '',
+  providers_json TEXT NOT NULL DEFAULT '[]',
+  status         TEXT NOT NULL DEFAULT 'running',  -- running|done|error
+  result_json    TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
@@ -477,6 +486,53 @@ class KnowledgeBase:
             d["after"] = json.loads(d.pop("after_json") or "{}")
             out.append(d)
         return out
+
+    def create_provider_run(self, filename: str, file_path: str,
+                              providers: list[str]) -> int:
+        """Start a bake-off run row; returns the run id."""
+        cur = self.conn.execute(
+            "INSERT INTO provider_runs (created_at, filename, file_path,"
+            " providers_json, status) VALUES (?,?,?,?,?)",
+            (self._now(), filename, file_path, json.dumps(providers), "running"))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def finish_provider_run(self, run_id: int, result: dict,
+                            status: str = "done") -> None:
+        self.conn.execute(
+            "UPDATE provider_runs SET status = ?, result_json = ? WHERE id = ?",
+            (status, json.dumps(result), run_id))
+        self.conn.commit()
+
+    def list_provider_runs(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, created_at, filename, providers_json, status"
+            " FROM provider_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["providers"] = json.loads(d.pop("providers_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                d["providers"] = []
+            out.append(d)
+        return out
+
+    def get_provider_run(self, run_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM provider_runs WHERE id = ?", (run_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["providers"] = json.loads(d.pop("providers_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            d["providers"] = []
+        try:
+            d["result"] = json.loads(d.pop("result_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["result"] = {}
+        return d
 
     def telemetry_row(self, doc_id: str) -> dict | None:
         row = self.conn.execute(

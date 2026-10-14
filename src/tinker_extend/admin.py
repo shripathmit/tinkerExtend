@@ -39,6 +39,7 @@ KB_PATH = os.environ.get("TINKER_KB_PATH", "./kb.sqlite3")
 SEED_DIR = os.environ.get("TINKER_SEED_DIR", "./seed_docs")
 UPLOAD_DIR = os.environ.get("TINKER_UPLOAD_DIR", "./uploads")
 MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # per file
+PLAYGROUND_DIR = os.environ.get("TINKER_PLAYGROUND_DIR", "/app/data/playground")
 
 # Shared access code for the admin console. Override in production.
 ADMIN_CODE = os.environ.get("TINKER_ADMIN_CODE", "extend")
@@ -395,6 +396,101 @@ def api_uploads():
         return {"dir": os.path.abspath(UPLOAD_DIR), "files": []}
     return {"dir": os.path.abspath(UPLOAD_DIR),
             "files": sorted(os.listdir(UPLOAD_DIR))}
+
+
+def _run_provider_comparison(run_id: int, path: str, names: list[str]) -> None:
+    """Background thread: run the provider bake-off, store the result."""
+    kb = _kb()
+    try:
+        from .providers import compare_providers
+        result = compare_providers(path, names)
+        kb.finish_provider_run(run_id, result, status="done")
+    except Exception as exc:  # noqa: BLE001 - the row must record the failure
+        kb.finish_provider_run(
+            run_id, {"error": f"{type(exc).__name__}: {exc}"}, status="error")
+    finally:
+        kb.close()
+
+
+@_api.get("/api/admin/providers")
+def api_providers():
+    """Beta playground: which parse providers are configured right now."""
+    from .providers import provider_status
+    return {"providers": provider_status(),
+            "beta": True,
+            "note": "Experimental playground. Production ingestion stays on Extend."}
+
+
+@_api.post("/api/admin/provider_runs")
+async def api_provider_run_start(file: UploadFile = File(...),
+                                 providers: str = Form("[]")):
+    """Upload a PDF and start a parse-provider bake-off in the background.
+
+    Returns immediately; poll GET /api/admin/provider_runs/{id} for the
+    result. The playground never touches the production knowledge base.
+    """
+    from .providers import PROVIDERS
+    try:
+        names = [n for n in json.loads(providers or "[]") if n in PROVIDERS]
+    except (json.JSONDecodeError, TypeError):
+        names = []
+    if not names:
+        names = list(PROVIDERS)
+    name = os.path.basename(file.filename or "").strip()
+    if not name.lower().endswith(".pdf"):
+        return JSONResponse({"error": "playground accepts PDF files only"},
+                            status_code=400)
+    os.makedirs(PLAYGROUND_DIR, exist_ok=True)
+    dest = os.path.join(PLAYGROUND_DIR, name)
+    stem, suffix = os.path.splitext(name)
+    i = 1
+    while os.path.exists(dest):
+        dest = os.path.join(PLAYGROUND_DIR, f"{stem}-{i}{suffix}")
+        i += 1
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise ValueError("file too large")
+    except ValueError:
+        if os.path.exists(dest):
+            os.remove(dest)
+        return JSONResponse({"error": "file too large"}, status_code=400)
+    kb = _kb()
+    try:
+        run_id = kb.create_provider_run(os.path.basename(dest), dest, names)
+    finally:
+        kb.close()
+    t = threading.Thread(target=_run_provider_comparison,
+                         args=(run_id, dest, names), daemon=True)
+    t.start()
+    return {"id": run_id, "status": "running", "providers": names}
+
+
+@_api.get("/api/admin/provider_runs")
+def api_provider_runs():
+    kb = _kb()
+    try:
+        return {"runs": kb.list_provider_runs()}
+    finally:
+        kb.close()
+
+
+@_api.get("/api/admin/provider_runs/{run_id}")
+def api_provider_run(run_id: int):
+    kb = _kb()
+    try:
+        row = kb.get_provider_run(run_id)
+    finally:
+        kb.close()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return row
 
 
 def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:

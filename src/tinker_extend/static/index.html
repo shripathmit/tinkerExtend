@@ -37,6 +37,10 @@
         <span>Golden Sets</span>
         <span id="nav-golden-count" class="font-mono text-[11px] text-inkFaint tabular-nums"></span>
       </a>
+      <a href="#data" data-tab="data" class="tab h-full flex items-center space-x-1.5 text-xs font-medium tracking-wide border-b shrink-0">
+        <span>Data</span>
+        <span class="font-mono text-[10px] px-1.5 py-px border border-hairline text-inkFaint rounded-sm">BETA</span>
+      </a>
     </nav>
 
     <div class="order-2 md:order-3 flex items-center space-x-4 sm:space-x-5 shrink-0 h-12 md:ml-6">
@@ -470,12 +474,80 @@
     </div>
   </main>
 
+  <main id="view-data" data-view="data" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
+    <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
+      <div class="lock-slot"></div>
+      <div class="view-body space-y-16">
+        <section class="flex flex-col sm:flex-row sm:items-end justify-between gap-6 border-b border-hairline pb-8">
+          <div class="space-y-2">
+            <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Beta Playground</div>
+            <h1 class="text-2xl font-light tracking-tight text-ink">Parse Provider Comparison</h1>
+            <p class="text-xs text-inkMuted max-w-xl leading-relaxed">
+              Parse the same document with Extend, OpenAI, and Gemini, then compare fidelity side by side.
+              Experimental &mdash; production ingestion stays on Extend.
+            </p>
+          </div>
+          <div class="flex items-center space-x-2 shrink-0">
+            <span class="font-mono text-[10px] px-2 py-1 border border-hairline text-inkFaint rounded-sm">BETA</span>
+          </div>
+        </section>
+
+        <section class="border-b border-hairline pb-8 space-y-6">
+          <h2 class="text-sm font-medium text-ink">New comparison</h2>
+          <div class="grid sm:grid-cols-2 gap-6">
+            <div class="space-y-3">
+              <label class="block text-xs text-inkFaint">PDF document</label>
+              <input type="file" id="data-file" accept=".pdf,application/pdf"
+                class="block w-full text-xs text-inkMuted file:mr-4 file:py-2 file:px-4 file:border file:border-hairline file:bg-transparent file:text-xs file:font-mono file:text-ink hover:file:bg-hairlineSubtle file:transition-colors file:cursor-pointer">
+              <p class="text-[11px] text-inkFaint leading-relaxed">Uploaded to the playground directory only &mdash; never ingested into the knowledge base.</p>
+            </div>
+            <div class="space-y-3">
+              <label class="block text-xs text-inkFaint">Providers</label>
+              <div id="data-providers" class="space-y-2"></div>
+            </div>
+          </div>
+          <div class="flex items-center gap-4">
+            <button type="button" id="data-run-btn"
+              class="px-4 py-2.5 bg-ink text-canvas text-xs font-mono font-medium hover:bg-inkMuted transition-colors disabled:opacity-60">Run comparison</button>
+            <span id="data-run-status" class="text-xs font-mono text-inkMuted"></span>
+          </div>
+        </section>
+
+        <section id="data-results" class="hidden space-y-10">
+          <div>
+            <h2 class="text-sm font-medium text-ink mb-1">Winners</h2>
+            <p id="data-winners-sub" class="text-[11px] text-inkFaint mb-4"></p>
+            <div id="data-winners" class="grid grid-cols-2 md:grid-cols-5 gap-px bg-hairline border border-hairline"></div>
+          </div>
+          <div>
+            <h2 class="text-sm font-medium text-ink mb-4">Fidelity &amp; cost</h2>
+            <div class="overflow-x-auto border border-hairline">
+              <table class="w-full text-left">
+                <thead>
+                  <tr id="data-compare-head" class="border-b border-hairline text-[11px] font-mono uppercase tracking-wider text-inkFaint"></tr>
+                </thead>
+                <tbody id="data-compare-tbody" class="divide-y divide-hairlineSubtle text-xs font-mono tabular-nums"></tbody>
+              </table>
+            </div>
+            <p class="text-[11px] text-inkFaint mt-3">LLM costs are approximate (tokens &times; list rates). Extend cost is exact (pages &times; engine rate).</p>
+          </div>
+          <div id="data-provider-cards" class="space-y-6"></div>
+        </section>
+
+        <section class="space-y-4">
+          <h2 class="text-sm font-medium text-ink">Past runs</h2>
+          <div id="data-runs" class="divide-y divide-hairlineSubtle border-y border-hairline"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+
   <template id="lock-template">
     <section class="max-w-md space-y-6 py-10">
       <div class="space-y-2">
         <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Console locked</div>
         <h1 class="text-2xl font-light tracking-tight text-ink lock-title">Enter the access code</h1>
-        <p class="text-xs text-inkMuted leading-relaxed">Overview, Ingestion, Parse Fidelity and Golden Sets need the console access code. Q&amp;A stays open to everyone.</p>
+        <p class="text-xs text-inkMuted leading-relaxed">Overview, Ingestion, Parse Fidelity, Golden Sets and Data need the console access code. Q&amp;A stays open to everyone.</p>
       </div>
       <form class="lock-form flex items-center border-b border-hairlineFocus focus-within:border-ink transition-colors pb-2">
         <input type="password" name="code" autocomplete="current-password" placeholder="Access code"

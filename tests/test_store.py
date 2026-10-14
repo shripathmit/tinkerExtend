@@ -75,13 +75,14 @@ def test_delete_document():
 
 
 def test_search_natural_language_query():
-    from tinker_extend.store import sanitize_fts_query
+    from tinker_extend.store import sanitize_fts_query, significant_terms
     kb = make_kb()
     kb.upsert_document(sample_doc())
     kb.add_chunks(sample_chunks())
-    assert sanitize_fts_query("What was total revenue?") == "What OR was OR total OR revenue"
+    assert significant_terms("What was total revenue?") == ["total", "revenue"]
     assert sanitize_fts_query("!!!") == ""
     hits = kb.search("What is the refund policy?")
     assert hits and hits[0]["chunk_id"] == "hash1:00000"
+    assert kb.search("What is the CEO's hobby?") == []  # AND finds nothing, OR neither
     assert kb.search("???") == []
     kb.close()

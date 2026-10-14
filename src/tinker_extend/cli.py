@@ -67,6 +67,32 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    from tinker_extend.eval import load_eval_set, run_eval
+
+    kb = KnowledgeBase(args.db or load_config().kb_path)
+    try:
+        cases = load_eval_set(args.eval_file)
+        report = run_eval(kb, cases, llm=None, k=args.k)
+    finally:
+        kb.close()
+    r, a, p = report["retrieval"], report["answers"], report["parse_health"]
+    print(f"Parse health: {p['kb_stats']['documents']} docs, "
+          f"{p['kb_stats']['chunks']} chunks, ~{p['kb_stats']['token_estimate']} tokens")
+    for d in p["documents"]:
+        print(f"  - {d['source']}: {d['chunks']} chunks, {d['pages']} pages, "
+              f"{d['empty_chunks']} empty, {d['chunks_with_tables']} with tables")
+    print(f"Retrieval @{r['k']}: hit_rate={r['hit_rate']:.2f}  mrr={r['mrr']:.2f}")
+    for q in r["misses"]:
+        print(f"  MISS: {q}")
+    print(f"Answers: mean_score={a['mean_score']:.2f}")
+    for c in a["per_case"]:
+        mark = "ok" if c["score"] >= 1.0 else "PARTIAL" if c["score"] > 0 else "FAIL"
+        print(f"  [{mark}] {c['question'][:70]}")
+    print(json.dumps(report, indent=2)[:2000])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tinker-extend", description="Extend-powered knowledge base")
     ap.add_argument("--db", default=None, help="SQLite KB path (default: $TINKER_KB_PATH or ./kb.sqlite3)")
@@ -86,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_s = sub.add_parser("stats", help="Show KB document/chunk counts")
     p_s.set_defaults(func=cmd_stats)
+
+    p_e = sub.add_parser("eval", help="Run the evaluation framework against a golden set")
+    p_e.add_argument("--eval-file", required=True, help="Path to golden Q&A JSONL")
+    p_e.add_argument("--k", type=int, default=5, help="Top-k for retrieval metrics")
+    p_e.set_defaults(func=cmd_eval)
 
     args = ap.parse_args(argv)
     return args.func(args)

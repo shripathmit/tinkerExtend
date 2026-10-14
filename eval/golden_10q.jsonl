@@ -1,0 +1,9 @@
+{"question": "By how much did R&D expenses decrease in Q1 2026?", "relevant_contains": ["decreased by $207 million"], "answer_contains": ["207", "24%"], "answerable": true}
+{"question": "How much did research and development costs fall year over year?", "relevant_contains": ["decreased by $207 million"], "answer_contains": ["207", "24%"], "answerable": true}
+{"question": "What drove the decrease in R&D expenses?", "relevant_contains": ["$48 million reduction in clinical manufacturing"], "answer_contains": ["48", "Blackstone"], "answerable": true}
+{"question": "How much cash and cash equivalents did Moderna have on March 31, 2026?", "relevant_contains": ["Cash and cash equivalents"], "answer_contains": ["1,908"], "answerable": true}
+{"question": "What were gross product sales in Q1 2026 compared to Q1 2025?", "relevant_contains": ["Gross product sales"], "answer_contains": ["350", "105"], "answerable": true}
+{"question": "What does the filing say about deferred revenue?", "relevant_contains": ["Deferred Revenue"], "answer_contains": ["deferred revenue"], "answerable": true}
+{"question": "Were there any changes in internal control over financial reporting?", "relevant_contains": ["no changes in our internal control"], "answer_contains": ["no changes"], "answerable": true}
+{"question": "What is the CEO's favorite food?", "relevant_contains": [], "answer_contains": [], "answerable": false}
+{"question": "Who won the 2026 World Cup?", "relevant_contains": [], "answer_contains": [], "answerable": false}

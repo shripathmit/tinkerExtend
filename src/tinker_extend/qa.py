@@ -8,7 +8,7 @@ Two modes:
 from __future__ import annotations
 
 from .llm import LLMClient
-from .store import KnowledgeBase
+from .store import KnowledgeBase, significant_terms
 
 SYSTEM_PROMPT = """You answer questions using ONLY the passages below.
 Rules:
@@ -34,13 +34,21 @@ def ask(question: str, kb: KnowledgeBase, llm: LLMClient | None = None,
         }
         for i, h in enumerate(hits)
     ]
+    terms = significant_terms(question)
+    no_answer = {
+        "question": question,
+        "mode": "none",
+        "answer": "I couldn't find anything relevant in the knowledge base.",
+        "passages": [],
+    }
     if not passages:
-        return {
-            "question": question,
-            "mode": "none",
-            "answer": "I couldn't find anything relevant in the knowledge base.",
-            "passages": [],
-        }
+        return no_answer
+    # Relevance gate: the top passage must share at least min(2, n_terms)
+    # significant terms with the question, or we abstain instead of
+    # answering from a coincidental single-word overlap.
+    overlap = sum(1 for t in terms if t in passages[0]["content"].lower())
+    if overlap < min(2, len(terms)):
+        return no_answer
     if llm is None:
         top = passages[0]["content"]
         return {

@@ -8,14 +8,29 @@ import sqlite3
 from .models import Chunk, Document
 
 
-def sanitize_fts_query(query: str) -> str:
-    """Make raw user text safe for FTS5 MATCH.
+STOPWORDS = frozenset(
+    "what is the a an was were are be been has have had does did do of in on for "
+    "to and or by with as at from that this it its which who whom whose how much "
+    "many when where why s t d no not there their they them then than so such "
+    "into over under about between through during each other some any all both "
+    "few more most only own same too very can will just should now".split()
+)
 
-    Terms are OR-ed; BM25 ranking surfaces chunks matching the most (and
-    rarest) terms. This handles both keyword queries and natural questions.
-    """
-    terms = re.findall(r"[A-Za-z0-9]+", query)
-    return " OR ".join(terms)
+
+def significant_terms(query: str) -> list[str]:
+    """Alphanumeric terms worth matching: lowercase, stopwords removed."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in re.findall(r"[A-Za-z0-9]+", query.lower()):
+        if len(tok) > 1 and tok not in STOPWORDS and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def sanitize_fts_query(query: str) -> str:
+    """Make raw user text safe for FTS5 MATCH (OR of significant terms)."""
+    return " OR ".join(significant_terms(query))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -139,10 +154,7 @@ class KnowledgeBase:
         ).fetchone()
         return row is not None
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
-        fts_query = sanitize_fts_query(query)
-        if not fts_query:
-            return []
+    def _fts(self, fts_query: str, limit: int) -> list[dict]:
         rows = self.conn.execute(
             """SELECT c.chunk_id, c.doc_id, c.ordinal, c.content,
                       c.pages_json, c.token_estimate,
@@ -157,6 +169,20 @@ class KnowledgeBase:
             (fts_query, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def search(self, query: str, limit: int = 10) -> list[dict]:
+        """Strict AND over significant terms first; OR fallback if empty.
+
+        AND keeps unanswerable questions answerless (so the QA layer can
+        abstain); the OR fallback keeps natural phrasing working.
+        """
+        terms = significant_terms(query)
+        if not terms:
+            return []
+        hits = self._fts(" AND ".join(terms), limit)
+        if not hits:
+            hits = self._fts(" OR ".join(terms), limit)
+        return hits
 
     def stats(self) -> dict:
         docs = self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]

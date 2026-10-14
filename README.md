@@ -66,6 +66,23 @@ OpenAI-compatible chat endpoint, still grounded and cited.
 Deploy: `Procfile` + `railway.json` are included. On first boot the app seeds
 itself from `./seed_docs` if the KB is empty and `EXTEND_API_KEY` is set.
 
+## Evaluation — how good is the system?
+
+Three layers, all runnable offline against your KB:
+
+1. **Parse health** — per-document metrics (chunks, pages, empty chunks,
+   tables detected) straight from ingest metadata.
+2. **Retrieval quality** — hit_rate@k and MRR over a golden Q&A set.
+3. **Answer quality** — expected facts present in answers; unanswerable
+   questions must abstain, not hallucinate.
+
+```bash
+python -m tinker_extend.cli --db ./kb.sqlite3 eval --eval-file eval/golden_10q.jsonl
+```
+
+Add cases to `eval/` as you ingest documents. Re-run on every change —
+a drop in hit_rate or abstention is a regression.
+
 ## Tests
 
 ```bash

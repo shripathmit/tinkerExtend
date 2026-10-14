@@ -134,6 +134,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="tinkerExtend Q&A", lifespan=lifespan)
+APP_VERSION = "0.5.1"  # trigger commit: verify Railway auto-deploy after reconnect
 os.makedirs(PAGE_IMG_DIR, exist_ok=True)
 app.mount("/page_images", StaticFiles(directory=PAGE_IMG_DIR), name="page_images")
 

@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .config import load_config
 from .extend_client import ExtendClient
 from .fidelity import check_golden_doc, load_golden_docs, red_flags
-from .ingest import iter_candidate_files
+from .ingest import SUPPORTED_EXTENSIONS, iter_candidate_files, sha256_file
 from .pipeline import WaveIngester
 from .store import KnowledgeBase
 
@@ -25,6 +26,8 @@ router = APIRouter()
 
 KB_PATH = os.environ.get("TINKER_KB_PATH", "./kb.sqlite3")
 SEED_DIR = os.environ.get("TINKER_SEED_DIR", "./seed_docs")
+UPLOAD_DIR = os.environ.get("TINKER_UPLOAD_DIR", "./uploads")
+MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # per file
 
 
 def _resolve_eval_file(env_key: str, default: str) -> str:
@@ -164,7 +167,6 @@ def api_golden_docs():
             doc_id = docs.get(spec.get("doc", ""))
             if not doc_id:
                 # The spec may name the seed copy; match by content hash.
-                from .ingest import sha256_file
                 for cand in (spec.get("doc", ""),
                              os.path.join(SEED_DIR, spec.get("doc", ""))):
                     if cand and os.path.exists(cand):
@@ -240,6 +242,59 @@ def api_dl_retry(dl_id: int):
                          daemon=True)
     t.start()
     return {"ok": True, "wave": wave}
+
+
+@router.post("/api/admin/upload")
+async def api_upload(files: list[UploadFile] = File(...)):
+    """Upload documents from the operator's machine into the upload dir.
+
+    Files land under TINKER_UPLOAD_DIR (put it on the persistent volume
+    in production); a wave can then ingest them. Filenames are sanitized,
+    extensions restricted to the ingest-supported set.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    saved, skipped = [], []
+    for f in files:
+        name = os.path.basename(f.filename or "").strip()
+        ext = os.path.splitext(name)[1].lower()
+        if not name or ext not in SUPPORTED_EXTENSIONS:
+            skipped.append({"file": f.filename, "reason": "unsupported type"})
+            continue
+        dest = os.path.join(UPLOAD_DIR, name)
+        stem, suffix = os.path.splitext(name)
+        i = 1
+        while os.path.exists(dest):
+            dest = os.path.join(UPLOAD_DIR, f"{stem}-{i}{suffix}")
+            i += 1
+        size = 0
+        try:
+            with open(dest, "wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise ValueError("file too large")
+                    out.write(chunk)
+        except ValueError:
+            if os.path.exists(dest):
+                os.remove(dest)
+            skipped.append({"file": name, "reason": "over 150MB"})
+            continue
+        finally:
+            await f.close()
+        saved.append(os.path.basename(dest))
+    return {"ok": True, "dir": os.path.abspath(UPLOAD_DIR),
+            "saved": saved, "skipped": skipped}
+
+
+@router.get("/api/admin/uploads")
+def api_uploads():
+    if not os.path.isdir(UPLOAD_DIR):
+        return {"dir": os.path.abspath(UPLOAD_DIR), "files": []}
+    return {"dir": os.path.abspath(UPLOAD_DIR),
+            "files": sorted(os.listdir(UPLOAD_DIR))}
 
 
 @router.post("/api/admin/waves")
@@ -410,6 +465,16 @@ ADMIN_PAGE = """<!DOCTYPE html>
 
   <section class="tab" id="tab-ingest">
     <div class="panel">
+      <h3>Upload documents <span class="sub">from your machine to the server</span></h3>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <input type="file" id="upFiles" multiple style="color:#a7b0bf;font-size:13px">
+        <button class="btn" id="upBtn" onclick="uploadFiles()">Upload</button>
+        <span class="num" style="font-size:12px;color:#697384" id="upStatus"></span>
+      </div>
+      <div class="err" id="upErr"></div>
+      <div style="margin-top:10px;font-size:13px;color:#8b94a3" id="upList"></div>
+    </div>
+    <div class="panel">
       <h3>Start a wave</h3>
       <div class="form">
         <div><label>Source directory</label><input id="wDir" value="./seed_docs"></div>
@@ -523,6 +588,7 @@ async function loadOverview(){
 
 async function loadIngest(){
   const [t, ov] = await Promise.all([api('/api/admin/telemetry?limit=100'), api('/api/admin/overview')]);
+  listUploads();
   $('docs').innerHTML = t.rows.length ? `<table><tr><th>Document</th><th>Wave</th><th>Type</th><th>Engine</th><th>Pages</th><th>Chunks</th><th>Tables</th><th>OCR</th><th>Coverage</th><th>Cost</th><th>Time</th><th>Status</th><th>Flags</th></tr>` +
     t.rows.map(r => `<tr><td>${esc(r.name)}</td><td><span class="tag2">${esc(r.wave || '—')}</span></td>
       <td><span class="tag2">${esc(r.doc_type || '—')}</span></td><td>${engineBadge(r.engine)}</td>
@@ -558,6 +624,35 @@ async function pollJobs(){
     if (!Object.values(d.jobs).some(j => j.status === 'running')) { clearInterval(jobTimer); refresh(); }
   };
   jobTimer = setInterval(tick, 3000);
+}
+
+async function uploadFiles(){
+  $('upErr').textContent = '';
+  const input = $('upFiles');
+  if (!input.files.length) { $('upErr').textContent = 'Choose files first.'; return; }
+  const btn = $('upBtn'); btn.disabled = true;
+  $('upStatus').textContent = 'uploading…';
+  try {
+    const fd = new FormData();
+    for (const f of input.files) fd.append('files', f);
+    const d = await api('/api/admin/upload', {method: 'POST', body: fd});
+    $('upStatus').textContent = `${d.saved.length} uploaded${d.skipped.length ? `, ${d.skipped.length} skipped` : ''}`;
+    if (d.skipped.length) $('upErr').textContent = d.skipped.map(s => `${s.file}: ${s.reason}`).join('; ');
+    // Point the wave launcher at the upload dir so one click starts the wave.
+    $('wDir').value = d.dir;
+    if (!$('wName').value) $('wName').value = 'upload-' + new Date().toISOString().slice(0, 10);
+    listUploads();
+  } catch (e) { $('upErr').textContent = e.message; $('upStatus').textContent = ''; }
+  btn.disabled = false;
+}
+async function listUploads(){
+  try {
+    const d = await api('/api/admin/uploads');
+    $('upList').innerHTML = d.files.length
+      ? `<b style="color:#dbe2ec">${d.files.length} file(s)</b> in <span class="mono" style="font-size:12px">${esc(d.dir)}</span><br>
+         <span style="font-size:12px">${d.files.slice(0, 12).map(esc).join(', ')}${d.files.length > 12 ? ` (+${d.files.length - 12} more)` : ''}</span>`
+      : 'No uploaded files yet.';
+  } catch (e) { /* ignore */ }
 }
 
 async function startWave(){

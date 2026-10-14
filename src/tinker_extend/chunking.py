@@ -16,9 +16,14 @@ def _pages_from_blocks(blocks: list) -> list[int]:
     for b in blocks:
         if not isinstance(b, dict):
             continue
-        for key in ("page", "pageNumber", "page_number"):
-            if isinstance(b.get(key), int) and b[key] not in pages:
-                pages.append(b[key])
+        # Real Extend blocks nest the page under metadata.page.number;
+        # keep the flat fallbacks for older/other shapes.
+        meta_page = (b.get("metadata") or {}).get("page") or {}
+        candidates = [meta_page.get("number"), b.get("page"),
+                      b.get("pageNumber"), b.get("page_number")]
+        for c in candidates:
+            if isinstance(c, int) and c not in pages:
+                pages.append(c)
     return sorted(pages)
 
 

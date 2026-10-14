@@ -116,9 +116,12 @@ def eval_answers(kb: KnowledgeBase, cases: list[EvalCase], llm=None, k: int = 5)
             "facts_expected": case.answer_contains,
         })
     n = len(per_case)
+    unanswerable = [c for c in per_case if not c.get("answerable", True)]
     return {
         "n": n,
         "mean_score": sum(c["score"] for c in per_case) / n if n else 0.0,
+        "abstention_rate": (sum(1 for c in unanswerable if c["abstained"]) / len(unanswerable)
+                            if unanswerable else 1.0),
         "per_case": per_case,
     }
 

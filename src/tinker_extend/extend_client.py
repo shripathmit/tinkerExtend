@@ -140,11 +140,18 @@ class ExtendClient:
         poll_interval_s: float = 5.0,
         timeout_s: float = 1800.0,
         metadata: dict | None = None,
+        engine: str | None = None,
     ) -> dict:
-        """POST /parse_runs then poll until PROCESSED/FAILED. The production path."""
+        """POST /parse_runs then poll until PROCESSED/FAILED. The production path.
+
+        engine: "parse_light" (cheap, text-heavy docs) or "parse_performance"
+        (tables, scans, handwriting). None = provider default.
+        """
         body: dict = {"file": file}
         if metadata:
             body["metadata"] = metadata
+        if engine:
+            body["config"] = {"engine": engine}
         run = self._request("POST", "/parse_runs", body)
         run_id = run.get("id")
         if not run_id:

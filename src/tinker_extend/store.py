@@ -56,6 +56,42 @@ CREATE TABLE IF NOT EXISTS chunks (
   embedding_json TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id, content);
+CREATE TABLE IF NOT EXISTS parse_telemetry (
+  doc_id         TEXT PRIMARY KEY REFERENCES documents(doc_id) ON DELETE CASCADE,
+  wave           TEXT NOT NULL DEFAULT '',
+  doc_type       TEXT NOT NULL DEFAULT '',
+  engine         TEXT NOT NULL DEFAULT '',
+  num_pages      INTEGER NOT NULL DEFAULT 0,
+  num_chunks     INTEGER NOT NULL DEFAULT 0,
+  num_tables     INTEGER NOT NULL DEFAULT 0,
+  empty_chunks   INTEGER NOT NULL DEFAULT 0,
+  garbled_chunks INTEGER NOT NULL DEFAULT 0,
+  text_coverage  REAL,
+  ocr_confidence REAL,
+  table_shape_ok INTEGER NOT NULL DEFAULT 0,
+  repeated_ngrams INTEGER NOT NULL DEFAULT 0,
+  cost_usd       REAL NOT NULL DEFAULT 0,
+  duration_s     REAL NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'ok',   -- ok | failed | skipped
+  error          TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dead_letter (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  source     TEXT NOT NULL,
+  wave       TEXT NOT NULL DEFAULT '',
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  resolved   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS waves (
+  name         TEXT PRIMARY KEY,
+  target       INTEGER NOT NULL DEFAULT 0,
+  status       TEXT NOT NULL DEFAULT 'running',  -- running | done | failed
+  created_at   TEXT NOT NULL,
+  completed_at TEXT
+);
 CREATE TABLE IF NOT EXISTS feedback (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at   TEXT NOT NULL,
@@ -72,10 +108,18 @@ CREATE TABLE IF NOT EXISTS feedback (
 class KnowledgeBase:
     def __init__(self, path: str = "./kb.sqlite3"):
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent column additions for databases created before them."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(documents)")}
+        if "doc_type" not in cols:
+            self.conn.execute("ALTER TABLE documents ADD COLUMN doc_type TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -221,6 +265,129 @@ class KnowledgeBase:
         rows = self.conn.execute(
             "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- Phase 0/1: telemetry, waves, dead letters -----------------------
+    @staticmethod
+    def _now() -> str:
+        import datetime
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def record_telemetry(self, doc_id: str, wave: str, doc_type: str,
+                         engine: str, metrics: dict, cost_usd: float,
+                         duration_s: float, status: str = "ok",
+                         error: str = "") -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO parse_telemetry (doc_id, wave, doc_type,"
+            " engine, num_pages, num_chunks, num_tables, empty_chunks,"
+            " garbled_chunks, text_coverage, ocr_confidence, table_shape_ok,"
+            " repeated_ngrams, cost_usd, duration_s, status, error, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (doc_id, wave, doc_type, engine,
+             metrics.get("num_pages", 0), metrics.get("num_chunks", 0),
+             metrics.get("table_blocks", 0), metrics.get("empty_chunks", 0),
+             metrics.get("garbled_chunks", 0), metrics.get("text_coverage"),
+             metrics.get("ocr_confidence"),
+             metrics.get("table_shape_ok", 0),
+             metrics.get("repeated_ngrams", 0),
+             cost_usd, duration_s, status, error[:2000], self._now()),
+        )
+        if doc_type:
+            self.conn.execute("UPDATE documents SET doc_type = ? WHERE doc_id = ?",
+                              (doc_type, doc_id))
+        self.conn.commit()
+
+    def telemetry(self, limit: int = 200) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT t.*, d.source FROM parse_telemetry t"
+            " JOIN documents d ON d.doc_id = t.doc_id"
+            " ORDER BY t.created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def fidelity_by_type(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT doc_type, COUNT(*) AS docs,"
+            " AVG(CASE WHEN num_tables>0 THEN CAST(table_shape_ok AS REAL)/num_tables ELSE 1 END) AS table_shape_rate,"
+            " AVG(CAST(empty_chunks AS REAL)/NULLIF(num_chunks,0)) AS empty_rate,"
+            " AVG(CAST(garbled_chunks AS REAL)/NULLIF(num_chunks,0)) AS garbled_rate,"
+            " AVG(ocr_confidence) AS ocr_confidence,"
+            " AVG(text_coverage) AS text_coverage,"
+            " SUM(cost_usd) AS cost_usd"
+            " FROM parse_telemetry WHERE status='ok' GROUP BY doc_type").fetchall()
+        return [dict(r) for r in rows]
+
+    def overview(self) -> dict:
+        t = self.conn.execute(
+            "SELECT COUNT(*) AS docs, COALESCE(SUM(cost_usd),0) AS cost,"
+            " SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,"
+            " SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed"
+            " FROM parse_telemetry").fetchone()
+        dl = self.conn.execute(
+            "SELECT COUNT(*) FROM dead_letter WHERE resolved=0").fetchone()[0]
+        fb = self.conn.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN rating>0 THEN 1 ELSE 0 END)"
+            " FROM feedback").fetchone()
+        return {
+            "docs": t["docs"], "cost_usd": round(t["cost"], 2),
+            "ok": t["ok"], "failed": t["failed"],
+            "success_rate": (t["ok"] / t["docs"]) if t["docs"] else 1.0,
+            "dead_letters": dl,
+            "feedback_total": fb[0], "feedback_positive": fb[1] or 0,
+        }
+
+    def add_dead_letter(self, source: str, wave: str, error: str) -> None:
+        row = self.conn.execute(
+            "SELECT id, attempts FROM dead_letter WHERE source=? AND resolved=0",
+            (source,)).fetchone()
+        if row:
+            self.conn.execute(
+                "UPDATE dead_letter SET attempts=attempts+1, last_error=?,"
+                " wave=?, created_at=? WHERE id=?",
+                (error[:2000], wave, self._now(), row["id"]))
+        else:
+            self.conn.execute(
+                "INSERT INTO dead_letter (source, wave, attempts, last_error,"
+                " created_at) VALUES (?,?,?,?,?)",
+                (source, wave, 1, error[:2000], self._now()))
+        self.conn.commit()
+
+    def list_dead_letters(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM dead_letter WHERE resolved=0 ORDER BY id DESC").fetchall()]
+
+    def resolve_dead_letter(self, dl_id: int) -> None:
+        self.conn.execute("UPDATE dead_letter SET resolved=1 WHERE id=?", (dl_id,))
+        self.conn.commit()
+
+    def requeue_dead_letter(self, dl_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM dead_letter WHERE id=? AND resolved=0", (dl_id,)).fetchone()
+        if not row:
+            return None
+        self.conn.execute("UPDATE dead_letter SET resolved=1 WHERE id=?", (dl_id,))
+        self.conn.commit()
+        return dict(row)
+
+    def create_wave(self, name: str, target: int) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO waves (name, target, status, created_at)"
+            " VALUES (?,?, 'running', ?)", (name, target, self._now()))
+        self.conn.commit()
+
+    def complete_wave(self, name: str, status: str = "done") -> None:
+        self.conn.execute(
+            "UPDATE waves SET status=?, completed_at=? WHERE name=?",
+            (status, self._now(), name))
+        self.conn.commit()
+
+    def waves(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT w.*, "
+            "(SELECT COUNT(*) FROM parse_telemetry t WHERE t.wave=w.name) AS ingested,"
+            "(SELECT COUNT(*) FROM parse_telemetry t WHERE t.wave=w.name AND t.status='ok') AS ok,"
+            "(SELECT COUNT(*) FROM parse_telemetry t WHERE t.wave=w.name AND t.status='failed') AS failed,"
+            "(SELECT COALESCE(SUM(cost_usd),0) FROM parse_telemetry t WHERE t.wave=w.name) AS cost_usd"
+            " FROM waves w ORDER BY w.created_at DESC").fetchall()
         return [dict(r) for r in rows]
 
     def get_document(self, doc_id: str) -> dict | None:

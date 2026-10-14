@@ -20,8 +20,11 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .admin import router as admin_router
+from .classify import classify_content
 from .config import load_config
 from .extend_client import ExtendClient
+from .fidelity import fidelity_metrics
 from .htmlfmt import to_safe_html
 from .ingest import iter_candidate_files
 from .llm import llm_from_env
@@ -126,17 +129,53 @@ def linkify_citations(text: str) -> str:
     return "".join(out)
 
 
+def backfill_telemetry() -> str:
+    """Compute fidelity metrics + telemetry for docs ingested before Phase 1.
+
+    No API calls — everything comes from the stored blocks. Runs once;
+    later docs get telemetry at ingest time.
+    """
+    kb = get_kb()
+    try:
+        existing = {r[0] for r in kb.conn.execute("SELECT doc_id FROM parse_telemetry")}
+        n = 0
+        for doc in kb.conn.execute("SELECT doc_id, source FROM documents"):
+            if doc["doc_id"] in existing:
+                continue
+            rows = kb.conn.execute(
+                "SELECT content, blocks_json FROM chunks WHERE doc_id = ?",
+                (doc["doc_id"],)).fetchall()
+            blocks: list = []
+            for r in rows:
+                try:
+                    blocks.extend(json.loads(r["blocks_json"] or "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            chunks = [r["content"] for r in rows]
+            metrics = fidelity_metrics(blocks, chunks)
+            doc_type, _, _ = classify_content("\n".join(chunks),
+                                             os.path.basename(doc["source"]))
+            kb.record_telemetry(doc["doc_id"], "backfill", doc_type, "default",
+                                metrics, cost_usd=0.0, duration_s=0.0, status="ok")
+            n += 1
+        return f"backfilled telemetry for {n} doc(s)"
+    finally:
+        kb.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("tinkerExtend boot:", seed_if_empty(), flush=True)
     print("tinkerExtend boot:", ensure_page_images(), flush=True)
+    print("tinkerExtend boot:", backfill_telemetry(), flush=True)
     yield
 
 
 app = FastAPI(title="tinkerExtend Q&A", lifespan=lifespan)
-APP_VERSION = "0.5.1"  # trigger commit: verify Railway auto-deploy after reconnect
+APP_VERSION = "0.6.0"  # admin console: Phase 0/1 visibility
 os.makedirs(PAGE_IMG_DIR, exist_ok=True)
 app.mount("/page_images", StaticFiles(directory=PAGE_IMG_DIR), name="page_images")
+app.include_router(admin_router)
 
 
 @app.get("/api/stats")
@@ -323,7 +362,8 @@ PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <header><h1>tinkerExtend Q&amp;A</h1><div class="sub" id="stats">loading…</div></header>
+  <header><h1>tinkerExtend Q&amp;A</h1><div class="sub" id="stats">loading…</div>
+    <div style="flex:1"></div><a href="/admin" style="color:#7ea2ff;font-size:13px;text-decoration:none">Console →</a></header>
   <div class="box">
     <input type="text" id="q" placeholder="Ask about your documents…" autocomplete="off">
     <button class="go" id="askBtn">Ask</button>

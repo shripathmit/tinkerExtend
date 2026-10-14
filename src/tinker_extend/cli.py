@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tinker_extend.config import load_config
 from tinker_extend.extend_client import ExtendClient
-from tinker_extend.pipeline import KnowledgeBasePipeline
+from tinker_extend.ingest import iter_candidate_files
+from tinker_extend.pipeline import KnowledgeBasePipeline, WaveIngester
 from tinker_extend.store import KnowledgeBase
 
 
@@ -67,6 +68,39 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_wave(args: argparse.Namespace) -> int:
+    """Phase 1: ingest a named wave with parallel workers and telemetry."""
+    cfg = load_config(kb_path=args.db)
+
+    def client_factory() -> ExtendClient:
+        return ExtendClient(
+            api_key=cfg.api_key,
+            api_version=cfg.api_version,
+            base_url=cfg.base_url,
+            workspace_id=cfg.workspace_id,
+        )
+
+    paths = iter_candidate_files([args.dir])
+    if args.limit:
+        paths = paths[: args.limit]
+    ingester = WaveIngester(client_factory, cfg.kb_path, workers=args.workers)
+
+    def on_progress(progress: dict, res: dict) -> None:
+        p = progress
+        print(f"[{p['done'] + p['failed'] + p['skipped']}/{p['total']}]"
+              f" ok={p['done']} failed={p['failed']} skipped={p['skipped']}"
+              f" :: {res['source']} -> {res['status']}", flush=True)
+
+    summary = ingester.run(paths, args.wave, progress_cb=on_progress)
+    print(json.dumps({k: v for k, v in summary.items() if k != "results"}, indent=2))
+    for r in summary["results"]:
+        if r["status"] == "failed":
+            print(f"FAILED: {r['source']}: {r.get('error')}")
+        elif r.get("flags"):
+            print(f"FLAGS [{r['source']}]: {'; '.join(r['flags'])}")
+    return 1 if summary["failed"] else 0
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     from tinker_extend.eval import load_eval_set, run_eval
 
@@ -117,6 +151,13 @@ def main(argv: list[str] | None = None) -> int:
     p_e.add_argument("--eval-file", required=True, help="Path to golden Q&A JSONL")
     p_e.add_argument("--k", type=int, default=5, help="Top-k for retrieval metrics")
     p_e.set_defaults(func=cmd_eval)
+
+    p_w = sub.add_parser("ingest-wave", help="Phase 1: ingest a named wave (parallel, telemetry, dead-letter)")
+    p_w.add_argument("--dir", required=True, help="Directory of documents to ingest")
+    p_w.add_argument("--wave", required=True, help="Wave name (e.g. pilot-100)")
+    p_w.add_argument("--limit", type=int, default=0, help="Max files to take (0 = all)")
+    p_w.add_argument("--workers", type=int, default=4, help="Parallel parse workers")
+    p_w.set_defaults(func=cmd_ingest_wave)
 
     args = ap.parse_args(argv)
     return args.func(args)

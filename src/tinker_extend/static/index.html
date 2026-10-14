@@ -302,7 +302,8 @@
   <main id="view-fidelity" data-view="fidelity" data-locked="1" class="view hidden flex-1 overflow-y-auto bg-canvas">
     <div class="max-w-[1120px] mx-auto px-4 py-10 sm:px-8 sm:py-12 lg:px-12 lg:py-14">
       <div class="lock-slot"></div>
-      <div class="view-body space-y-16">
+      <div class="view-body">
+      <div id="fidelity-list" class="space-y-16">
         <section class="flex flex-col sm:flex-row sm:items-end justify-between gap-6 border-b border-hairline pb-8">
           <div class="space-y-2">
             <div class="text-xs font-mono uppercase tracking-wider text-inkFaint">Pipeline Stage 02 · Parse Fidelity</div>
@@ -357,6 +358,46 @@
             </table>
           </div>
         </section>
+      </div>
+      <div id="fidelity-detail" class="hidden space-y-12">
+        <div class="flex items-center justify-between gap-4 text-xs font-mono">
+          <a href="#fidelity" class="text-inkMuted hover:text-ink">← All documents</a>
+          <span class="text-inkFaint uppercase tracking-wider">Parse Fidelity Inspection</span>
+        </div>
+
+        <section class="flex flex-col lg:flex-row lg:items-end justify-between gap-8 border-b border-hairline pb-10">
+          <div class="space-y-3 min-w-0">
+            <h1 id="fd-title" class="text-2xl font-light tracking-tight text-ink break-words"></h1>
+            <div id="fd-meta" class="text-xs font-mono text-inkFaint"></div>
+            <p id="fd-verdict" class="text-base text-ink leading-relaxed max-w-2xl"></p>
+          </div>
+          <div class="shrink-0 lg:text-right space-y-3">
+            <button type="button" id="fd-reparse" class="whitespace-nowrap px-5 py-2.5 bg-ink text-canvas text-xs font-mono font-medium hover:bg-inkMuted transition-colors disabled:opacity-50">Re-parse with Performance Engine</button>
+            <div id="fd-cost" class="font-mono text-[11px] text-inkFaint"></div>
+          </div>
+        </section>
+
+        <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,360px)_minmax(0,1fr)] gap-12">
+          <aside class="space-y-12 lg:sticky lg:top-0 lg:self-start">
+            <section class="space-y-3">
+              <h2 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Checks</h2>
+              <div id="fd-checks" class="border-t border-hairline divide-y divide-hairlineSubtle"></div>
+            </section>
+            <section class="space-y-3">
+              <div class="flex items-center justify-between text-xs font-mono">
+                <h2 id="fd-engine-label" class="uppercase tracking-wider text-inkFaint">Performance engine</h2>
+                <span id="fd-engine-status"></span>
+              </div>
+              <div id="fd-engine" class="p-5 bg-surface border border-hairline font-mono text-xs text-inkMuted leading-relaxed space-y-3"></div>
+            </section>
+          </aside>
+
+          <section class="space-y-12 min-w-0">
+            <div id="fd-groups" class="space-y-14"></div>
+          </section>
+        </div>
+      </div>
+
       </div>
     </div>
   </main>
@@ -428,53 +469,6 @@
       </div>
     </div>
   </main>
-
-  <!-- ================================================================ -->
-  <!-- SLIDE-OVER: fidelity inspection + Performance re-parse            -->
-  <!-- ================================================================ -->
-  <div id="diff-sheet-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 flex justify-end">
-    <div role="dialog" aria-modal="true" aria-labelledby="diff-doc-title"
-      class="w-full max-w-2xl bg-canvas border-l border-hairline h-full flex flex-col justify-between p-6 sm:p-8 lg:p-12 overflow-y-auto">
-      <div class="space-y-6">
-        <div class="flex items-start justify-between gap-4 pb-6 border-b border-hairline">
-          <div class="space-y-1 min-w-0">
-            <span class="text-xs font-mono uppercase tracking-wider text-inkFaint">Parse Fidelity Inspection</span>
-            <h3 id="diff-doc-title" class="font-mono text-sm text-ink break-all"></h3>
-          </div>
-          <button type="button" id="diff-close" class="text-xs font-mono text-inkFaint hover:text-ink shrink-0">Close [Esc]</button>
-        </div>
-        <p id="diff-verdict" class="text-sm text-ink leading-relaxed"></p>
-
-        <section class="space-y-3">
-          <div class="flex items-center justify-between text-xs font-mono">
-            <h4 class="uppercase tracking-wider text-inkFaint">Checks</h4>
-            <span id="diff-engine" class="text-inkFaint"></span>
-          </div>
-          <div id="diff-checks" class="border-t border-hairline divide-y divide-hairlineSubtle"></div>
-        </section>
-
-        <section id="diff-examples-section" class="space-y-3">
-          <h4 class="text-xs font-mono uppercase tracking-wider text-inkFaint">Examples from this document</h4>
-          <div id="diff-examples" class="space-y-5"></div>
-        </section>
-
-        <section class="space-y-3">
-          <div class="flex items-center justify-between text-xs font-mono">
-            <h4 id="diff-right-label" class="uppercase tracking-wider text-inkFaint">Performance engine</h4>
-            <span id="diff-right-status"></span>
-          </div>
-          <div id="diff-right" class="p-5 bg-surface border border-hairline font-mono text-xs text-inkMuted leading-relaxed space-y-3"></div>
-        </section>
-      </div>
-      <div class="pt-8 mt-8 border-t border-hairline flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <span id="diff-cost" class="font-mono text-xs text-inkFaint"></span>
-        <div class="flex items-center justify-end space-x-6">
-          <button type="button" id="diff-cancel" class="text-xs text-inkFaint hover:text-ink">Cancel</button>
-          <button type="button" id="diff-reparse" class="whitespace-nowrap px-5 py-2.5 bg-ink text-canvas text-xs font-medium hover:bg-inkMuted transition-colors disabled:opacity-50">Re-parse with Performance Engine</button>
-        </div>
-      </div>
-    </div>
-  </div>
 
   <template id="lock-template">
     <section class="max-w-md space-y-6 py-10">

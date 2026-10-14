@@ -46,7 +46,8 @@ const state = {
   overview: null,
   telemetry: null,
   golden: null,
-  diff: { docId: null, job: null },
+  fidelityDoc: null,      // doc_id when #fidelity/<doc_id> is open
+  fidelityAll: false,     // detail page: show every example, not 3 per issue
   reparseAllArmed: false,
 };
 
@@ -78,13 +79,17 @@ async function api(path, opts = {}) {
 // ---------------------------------------------------------------------------
 // Routing + header
 // ---------------------------------------------------------------------------
-function currentTab() {
-  const h = (location.hash || '#qa').slice(1);
-  return TABS.includes(h) ? h : 'qa';
+function parseHash() {
+  const [tab, ...rest] = (location.hash || '#qa').slice(1).split('/');
+  const detail = rest.length ? decodeURIComponent(rest.join('/')) : null;
+  return TABS.includes(tab) ? { tab, detail: tab === 'fidelity' ? detail : null } : { tab: 'qa', detail: null };
 }
+
+function currentTab() { return parseHash().tab; }
 
 function switchView(view) {
   state.view = view;
+  state.fidelityDoc = parseHash().detail;
   document.querySelectorAll('.view').forEach((el) => el.classList.toggle('hidden', el.dataset.view !== view));
   document.querySelectorAll('#tabs .tab').forEach((el) => {
     const on = el.dataset.tab === view;
@@ -106,7 +111,7 @@ async function loadView(view) {
   try {
     if (view === 'overview') await loadOverview();
     else if (view === 'ingestion') await loadIngestion();
-    else if (view === 'fidelity') await loadFidelity();
+    else if (view === 'fidelity') await (state.fidelityDoc ? loadFidelityDetail(state.fidelityDoc) : loadFidelity());
     else if (view === 'golden') await loadGolden();
   } catch (e) {
     if (e instanceof LockedError) showLock(main);
@@ -742,6 +747,8 @@ function tableShapeText(r) {
 }
 
 async function loadFidelity() {
+  $('fidelity-detail').classList.add('hidden');
+  $('fidelity-list').classList.remove('hidden');
   const tel = await api('/api/admin/telemetry?limit=1000');
   state.telemetry = tel.rows;
   const rows = tel.rows;
@@ -824,19 +831,19 @@ const CHECK_MARK = {
 };
 
 function renderChecks(checks) {
-  // Failing checks first, then passing, then not applicable.
+  // Failing checks first, then passing, then not applicable. The reason
+  // spans the full row so it reads as a sentence, not a narrow column.
   const order = (c) => (c.ok === false ? 0 : c.ok === true ? 1 : 2);
   return [...checks].sort((a, b) => order(a) - order(b)).map((c) => `
-    <div class="py-3 grid grid-cols-[1rem_1fr_auto] gap-x-3 items-baseline">
+    <div class="py-3 grid grid-cols-[1rem_minmax(0,1fr)_auto] gap-x-3 gap-y-1 items-baseline">
       <span class="font-mono text-xs">${CHECK_MARK[c.ok]}</span>
-      <div class="min-w-0">
-        <div class="text-xs ${c.ok === false ? 'text-ink' : 'text-inkMuted'}">${esc(c.label)}</div>
-        ${c.ok === false ? `<div class="text-[11px] text-inkFaint leading-relaxed mt-1">${esc(c.why)}</div>` : ''}
-      </div>
-      <div class="text-right font-mono text-xs whitespace-nowrap">
-        <div class="${c.ok === false ? 'text-amberWarn' : 'text-inkMuted'}">${esc(c.value)}</div>
-        <div class="text-[11px] text-inkFaint mt-0.5">${c.ok === null ? '' : `target ${esc(c.threshold)}`}</div>
-      </div>
+      <span class="text-xs ${c.ok === false ? 'text-ink' : 'text-inkMuted'}">${esc(c.label)}</span>
+      <span class="text-right font-mono text-xs ${c.ok === false ? 'text-amberWarn' : 'text-inkMuted'}">${esc(c.value)}</span>
+      ${c.ok === null ? '' : `
+      <span></span>
+      <span class="col-span-2 text-[11px] text-inkFaint leading-relaxed">
+        <span class="font-mono">target ${esc(c.threshold)}</span>${c.ok === false ? ` · ${esc(c.why)}` : ''}
+      </span>`}
     </div>`).join('');
 }
 
@@ -860,42 +867,50 @@ function renderTableExample(t) {
     </div>`;
 }
 
-const EXAMPLE_HELP = {
-  'Page number leaked into body': 'The number at the start or end of this passage is the page number, not content.',
-  'Empty chunk': 'This passage has almost no text.',
-  'Garbled text': 'This passage contains broken characters.',
+const GROUP_HELP = {
+  table_shape: 'Rows with a different number of cells than the rest of their table. Figures in these rows may sit in the wrong column.',
+  page_leak: 'The page number was read as part of the passage text. It is marked below, at the start or end of the passage.',
+  garbled: 'Passages with broken characters, usually from an encoding or OCR problem.',
+  empty: 'Passages with almost no text. They add noise to search without adding content.',
 };
 
-async function openDiffSheet(docId) {
-  state.diff = { docId, job: null };
-  $('diff-sheet-backdrop').classList.remove('hidden');
-  $('diff-doc-title').textContent = 'Loading…';
-  ['diff-verdict', 'diff-checks', 'diff-examples', 'diff-right', 'diff-cost'].forEach((id) => { $(id).innerHTML = ''; });
-  $('diff-close').focus();
-  try {
-    renderDiff(await api(`/api/admin/doc/${encodeURIComponent(docId)}/fidelity`));
-  } catch (e) {
-    if (!(e instanceof LockedError)) $('diff-verdict').textContent = e.message;
-  }
+const fidelityUrl = (docId) => `#fidelity/${encodeURIComponent(docId)}`;
+
+function openFidelityDetail(docId) {
+  state.fidelityAll = false;
+  location.hash = fidelityUrl(docId);
 }
 
-function renderDiff(d) {
-  $('diff-doc-title').textContent = d.name;
-  $('diff-verdict').textContent = d.verdict;
-  $('diff-engine').textContent = `Parsed with ${engineLabel(d.engine)} engine · ${d.pages} page${d.pages === 1 ? '' : 's'}`;
-  $('diff-checks').innerHTML = renderChecks(d.checks || []);
+async function loadFidelityDetail(docId) {
+  $('fidelity-list').classList.add('hidden');
+  $('fidelity-detail').classList.remove('hidden');
+  const main = $('view-fidelity');
+  if (state.renderedDetail !== docId) {
+    $('fd-title').textContent = 'Loading…';
+    ['fd-meta', 'fd-verdict', 'fd-checks', 'fd-engine', 'fd-groups', 'fd-cost'].forEach((id) => { $(id).innerHTML = ''; });
+    main.scrollTop = 0;
+  }
+  const d = await api(`/api/admin/doc/${encodeURIComponent(docId)}/fidelity?per_kind=${state.fidelityAll ? 25 : 3}`);
+  if (state.fidelityDoc !== docId) return;  // navigated away meanwhile
+  state.renderedDetail = docId;
+  renderFidelityDetail(d);
+}
 
-  $('diff-examples-section').classList.toggle('hidden', !d.excerpts.length);
-  $('diff-examples').innerHTML = d.excerpts.map((x) => `
-    <div class="space-y-2">
-      <div class="text-xs font-mono text-ink">${esc(x.kind)}${x.page != null ? ` <span class="text-inkFaint">· page ${x.page}</span>` : ''}</div>
-      ${x.table ? renderTableExample(x.table) : `
-        ${EXAMPLE_HELP[x.kind] ? `<p class="text-xs text-inkMuted">${esc(EXAMPLE_HELP[x.kind])}</p>` : ''}
-        <div class="p-3 bg-surface border-l-2 border-amberWarn font-mono text-xs text-ink leading-relaxed break-words">${esc(x.text || '(empty)')}</div>`}
-    </div>`).join('');
+function renderFidelityDetail(d) {
+  $('fd-title').textContent = d.name;
+  $('fd-meta').textContent = [
+    `${engineLabel(d.engine)} engine`, `${d.pages} page${d.pages === 1 ? '' : 's'}`,
+    `${d.num_chunks} passage${d.num_chunks === 1 ? '' : 's'}`, d.doc_type || null,
+  ].filter(Boolean).join(' · ');
+  $('fd-verdict').textContent = d.verdict;
+  $('fd-checks').innerHTML = renderChecks(d.checks || []);
+  renderEngineSection(d);
+  renderGroups(d);
+}
 
+function renderEngineSection(d) {
   const last = d.history[0];
-  const btn = $('diff-reparse');
+  const btn = $('fd-reparse');
   if (last) {
     const before = last.before || {};
     const after = last.after || {};
@@ -909,52 +924,137 @@ function renderDiff(d) {
     };
     const tables = (r) => (r.num_tables ? `${r.table_shape_ok}/${r.num_tables}` : 'none');
     const cov = (r) => (r.text_coverage == null ? 'n/a' : pct(r.text_coverage));
-    $('diff-right-label').textContent = `Before → after (${engineLabel(last.engine)})`;
-    $('diff-right-status').innerHTML = `<span class="text-xs font-mono text-inkFaint">${esc(new Date(last.at).toLocaleString())}</span>`;
-    $('diff-right').innerHTML = [
+    $('fd-engine-label').textContent = `Before → after (${engineLabel(last.engine)})`;
+    $('fd-engine-status').innerHTML = `<span class="text-[11px] font-mono text-inkFaint">${esc(new Date(last.at).toLocaleString())}</span>`;
+    $('fd-engine').innerHTML = [
       row('Consistent tables', tables(before), tables(after)),
       row('Page numbers in text', before.repeated_ngrams, after.repeated_ngrams, 'down'),
       row('Text coverage', cov(before), cov(after)),
       row('Empty passages', before.empty_chunks, after.empty_chunks, 'down'),
-      row('Chunks', before.num_chunks, after.num_chunks),
+      row('Passages', before.num_chunks, after.num_chunks),
       `<div class="flex justify-between gap-4"><span>Cost</span><span class="text-ink">${money(last.cost_usd)}</span></div>`,
     ].join('');
   } else {
-    $('diff-right-label').textContent = 'Performance engine';
-    $('diff-right-status').innerHTML = '<span class="text-xs font-mono text-inkFaint">Not run yet</span>';
-    $('diff-right').innerHTML = `
+    $('fd-engine-label').textContent = 'Performance engine';
+    $('fd-engine-status').innerHTML = '<span class="text-[11px] font-mono text-inkFaint">Not run yet</span>';
+    $('fd-engine').innerHTML = `
       <p>Re-parses this document with Extend's <span class="text-ink">parse_performance</span> engine, which is stronger on tables, scans and multi-column layouts.</p>
       <p>Replaces the document's passages, vectors and checks. The current numbers are kept, so this section then shows before → after.</p>`;
   }
-  $('diff-cost').textContent = `Estimated cost: ${money(d.estimated_cost_usd)} (${d.pages} page${d.pages === 1 ? '' : 's'} × $${PERF_RATE})`;
+  $('fd-cost').textContent = d.source_available
+    ? `Estimated ${money(d.estimated_cost_usd)} · ${d.pages} page${d.pages === 1 ? '' : 's'} × $${PERF_RATE}`
+    : 'Original file not on server · re-upload it from Ingestion to re-parse';
   btn.disabled = !d.source_available;
+  btn.dataset.doc = d.doc_id;
   btn.textContent = last ? 'Re-parse Again' : 'Re-parse with Performance Engine';
-  btn.title = d.source_available ? '' : 'The original file is not on the server. Re-upload it from Ingestion to re-parse.';
-  if (!d.source_available) $('diff-cost').textContent += ' · original file not on server';
 }
 
-function closeDiffSheet() {
-  $('diff-sheet-backdrop').classList.add('hidden');
-  state.diff = { docId: null, job: null };
+function renderGroups(d) {
+  const groups = d.groups || [];
+  if (!groups.length) {
+    $('fd-groups').innerHTML = `<div class="py-6 text-xs font-mono text-emeraldOk border-t border-hairline">No problem passages found in this document.</div>`;
+    return;
+  }
+  const anyHidden = groups.some((g) => g.total > g.items.length);
+  $('fd-groups').innerHTML = groups.map((g) => `
+    <section class="space-y-5">
+      <div class="border-b border-hairline pb-3 space-y-1.5">
+        <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+          <h2 class="text-sm text-ink">${esc(g.kind)}</h2>
+          <span class="text-xs font-mono text-amberWarn tabular-nums">${g.key === 'table_shape'
+            ? `${g.total} table${g.total === 1 ? '' : 's'}` : `${g.total} passage${g.total === 1 ? '' : 's'}`}</span>
+        </div>
+        <p class="text-xs text-inkMuted leading-relaxed">${esc(GROUP_HELP[g.key] || '')}</p>
+      </div>
+      <div class="space-y-10">${g.items.map((x) => renderExample(g.key, x, d.doc_id)).join('')}</div>
+      ${g.total > g.items.length ? `<div class="text-[11px] font-mono text-inkFaint">Showing ${g.items.length} of ${g.total}</div>` : ''}
+    </section>`).join('') + (anyHidden && !state.fidelityAll
+      ? `<button type="button" id="fd-show-all" class="text-xs font-mono text-inkMuted hover:text-ink underline underline-offset-4">Show all examples</button>` : '');
+  // Page previews load after the text so the page is readable immediately.
+  document.querySelectorAll('#fd-groups [data-thumb]').forEach((el) => loadThumb(el));
 }
 
-async function onDiffReparse() {
-  const docId = state.diff.docId;
+function exampleHeader(x, docId) {
+  return `
+    <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-xs font-mono">
+      <span class="text-inkFaint">${x.page != null ? `Page ${x.page}` : 'Page unknown'}</span>
+      ${x.page != null ? `<button type="button" data-open-doc="${esc(docId)}" data-open-page="${x.page}" class="text-inkMuted hover:text-ink">View page in Q&amp;A →</button>` : ''}
+    </div>`;
+}
+
+function renderLeakLines(leak) {
+  return `
+    <div class="border border-hairline bg-surface font-mono text-xs leading-relaxed">
+      ${leak.lines.map((l) => l.gap != null
+        ? `<div class="px-3 py-1 text-[11px] text-inkFaint">··· ${l.gap} more line${l.gap === 1 ? '' : 's'}</div>`
+        : `<div class="grid grid-cols-[2.5rem_1fr_auto] gap-x-2 px-3 py-1.5 ${l.mark ? 'bg-amberWarn/10' : ''}">
+             <span class="text-right text-inkFaint tabular-nums">${l.n}</span>
+             <span class="${l.mark ? 'text-amberWarn' : 'text-inkMuted'} break-words min-w-0">${esc(l.text)}</span>
+             <span class="text-[11px] ${l.mark ? 'text-amberWarn' : ''} whitespace-nowrap">${l.mark ? '← page number' : ''}</span>
+           </div>`).join('')}
+    </div>`;
+}
+
+function renderExample(key, x, docId) {
+  if (key === 'table_shape' && x.table) {
+    return `<div class="space-y-3">${exampleHeader(x, docId)}${renderTableExample(x.table)}</div>`;
+  }
+  let body;
+  let caption = '';
+  if (key === 'page_leak' && x.leak) {
+    const where = x.leak.edge === 'start' ? 'first' : 'last';
+    caption = `"${x.leak.value}" is the ${where} line of this passage. It is the page number, not content.`;
+    body = renderLeakLines(x.leak);
+  } else {
+    caption = key === 'empty' ? 'The whole passage:' : 'Excerpt with the broken text:';
+    body = `<div class="p-3 bg-surface border-l-2 border-amberWarn font-mono text-xs text-ink leading-relaxed break-words">${esc(x.text || '(empty)')}</div>`;
+  }
+  return `
+    <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_180px] gap-5">
+      <div class="space-y-3 min-w-0">
+        ${exampleHeader(x, docId)}
+        <p class="text-xs text-inkMuted leading-relaxed">${esc(caption)}</p>
+        ${body}
+      </div>
+      ${x.page != null ? `<div data-thumb data-doc="${esc(docId)}" data-page="${x.page}" data-chunk="${esc(x.chunk_id)}" data-kind="${key}" class="hidden sm:block self-start"></div>` : ''}
+    </div>`;
+}
+
+/** Small page preview with the problem region boxed (amber) inside the passage (blue). */
+async function loadThumb(el) {
+  let data;
+  try { data = await fetchPage(el.dataset.doc, parseInt(el.dataset.page, 10)); } catch (e) { return; }
+  if (!data.image_url || !el.isConnected) return;
+  const W = data.width || 1, H = data.height || 1;
+  const chunk = data.chunks.find((c) => c.chunk_id === el.dataset.chunk);
+  const focusType = { page_leak: 'page_number', table_shape: 'table' }[el.dataset.kind];
+  const boxes = (chunk ? chunk.boxes : []).map((b) => {
+    const strong = focusType ? b.type === focusType : true;
+    const style = `left:${(b.left / W) * 100}%;top:${(b.top / H) * 100}%;width:${((b.right - b.left) / W) * 100}%;height:${((b.bottom - b.top) / H) * 100}%`;
+    return `<div class="absolute ${strong ? 'hl-active' : 'hl-other'}" style="${style}"></div>`;
+  }).join('');
+  el.innerHTML = `
+    <button type="button" data-open-doc="${esc(el.dataset.doc)}" data-open-page="${el.dataset.page}" class="block w-full text-left space-y-1.5 group" title="Open page ${el.dataset.page} in the Q&A viewer">
+      <div class="relative bg-white border border-hairlineFocus group-hover:border-inkMuted transition-colors"><img src="${esc(data.image_url)}" alt="Page ${el.dataset.page}" class="block w-full h-auto" loading="lazy">${boxes}</div>
+      <div class="text-[11px] font-mono text-inkFaint group-hover:text-inkMuted">Where on page ${el.dataset.page}</div>
+    </button>`;
+}
+
+async function onDetailReparse() {
+  const btn = $('fd-reparse');
+  const docId = btn.dataset.doc;
   if (!docId) return;
-  const btn = $('diff-reparse');
   btn.disabled = true;
   btn.textContent = 'Starting…';
   try {
     const r = await api('/api/admin/reparse', { json: { doc_ids: [docId] } });
-    state.diff.job = r.job;
     await followJob(r.job, (p) => { btn.textContent = `Re-parsing ${p}…`; });
     state.golden = null;
     state.pageCache.clear();
-    if (state.diff.docId === docId) renderDiff(await api(`/api/admin/doc/${encodeURIComponent(docId)}/fidelity`));
-    if (state.view !== 'qa') loadView(state.view);
+    if (state.fidelityDoc === docId) { state.renderedDetail = null; await loadFidelityDetail(docId); }
   } catch (e) {
     if (!(e instanceof LockedError)) {
-      $('diff-cost').textContent = `Re-parse failed: ${e.message}`;
+      $('fd-cost').textContent = `Re-parse failed: ${e.message}`;
       btn.disabled = false;
       btn.textContent = 'Retry Re-parse';
     }
@@ -1024,12 +1124,12 @@ async function onRunSuite() {
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
-function openDocInWorkspace(docId) {
+function openDocInWorkspace(docId, page = 1) {
   state.result = null;
   state.viewer.focusChunk = null;
   renderWorkspace();
   location.hash = '#qa';
-  showPage(docId, 1, { scrollToActive: false });
+  showPage(docId, page, { scrollToActive: false });
 }
 
 document.addEventListener('click', async (ev) => {
@@ -1038,8 +1138,8 @@ document.addEventListener('click', async (ev) => {
   if (t.matches('.cite')) { const n = parseInt(t.dataset.n, 10) - 1; if (state.result && state.result.passages[n]) selectSource(n); return; }
   if (t.dataset.source !== undefined) { selectSource(parseInt(t.dataset.source, 10)); return; }
   if (t.dataset.example !== undefined) { $('query-input').value = t.dataset.example; setSearchType('ask'); return; }
-  if (t.dataset.inspect !== undefined) { openDiffSheet(t.dataset.inspect); return; }
-  if (t.dataset.openDoc !== undefined) { openDocInWorkspace(t.dataset.openDoc); return; }
+  if (t.dataset.inspect !== undefined) { openFidelityDetail(t.dataset.inspect); return; }
+  if (t.dataset.openDoc !== undefined) { openDocInWorkspace(t.dataset.openDoc, parseInt(t.dataset.openPage || '1', 10)); return; }
   if (t.dataset.chunk !== undefined && t.closest('#document-sheet')) { focusChunkInViewer(t.dataset.chunk); return; }
   if (t.dataset.issue !== undefined) { pickIssue(t.dataset.issue); return; }
   if (t.dataset.searchType !== undefined) { setSearchType(t.dataset.searchType); return; }
@@ -1051,7 +1151,8 @@ document.addEventListener('click', async (ev) => {
 });
 
 document.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Escape' && !$('diff-sheet-backdrop').classList.contains('hidden')) { closeDiffSheet(); return; }
+  if (ev.key === 'Escape' && state.view === 'fidelity' && state.fidelityDoc
+      && !['INPUT', 'TEXTAREA'].includes(ev.target.tagName)) { location.hash = '#fidelity'; return; }
   if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.dataset && ev.target.dataset.source !== undefined) {
     ev.preventDefault();
     selectSource(parseInt(ev.target.dataset.source, 10));
@@ -1108,10 +1209,10 @@ function init() {
   $('reparse-all-btn').addEventListener('click', onReparseAll);
   $('reparse-all-cancel').addEventListener('click', () => { disarmReparseAll(); loadFidelity(); });
   $('run-suite-btn').addEventListener('click', onRunSuite);
-  $('diff-close').addEventListener('click', closeDiffSheet);
-  $('diff-cancel').addEventListener('click', closeDiffSheet);
-  $('diff-reparse').addEventListener('click', onDiffReparse);
-  $('diff-sheet-backdrop').addEventListener('click', (ev) => { if (ev.target === $('diff-sheet-backdrop')) closeDiffSheet(); });
+  $('fd-reparse').addEventListener('click', onDetailReparse);
+  $('fidelity-detail').addEventListener('click', (ev) => {
+    if (ev.target.id === 'fd-show-all') { state.fidelityAll = true; loadFidelityDetail(state.fidelityDoc); }
+  });
   window.addEventListener('hashchange', () => switchView(currentTab()));
 
   $('toggle-surface-btn').textContent = `Surface: ${{ image: 'Image', reader: 'Reader', paper: 'Paper' }[state.surface]}`;

@@ -244,3 +244,27 @@ def test_fidelity_recompute_runs_once_and_keeps_coverage_without_source(env):
     kb = KnowledgeBase(env["kb_path"])
     assert kb.telemetry_row(env["doc_id"])["text_coverage"] == 0.81
     kb.close()
+
+
+def test_doc_fidelity_groups_examples_with_leak_lines(env):
+    doc_id = env["doc_id"]
+    leak_text = "Net product sales increased.\nRevenue was flat.\n12"
+    blocks = _blocks(1, "Net product sales increased.") + _blocks(1, "12", kind="page_number")
+    kb = KnowledgeBase(env["kb_path"])
+    kb.add_chunks([
+        Chunk(chunk_id=f"{doc_id}:00010", doc_id=doc_id, ordinal=10, content=leak_text,
+              pages_json="[1]", blocks_json=json.dumps(blocks)),
+        Chunk(chunk_id=f"{doc_id}:00011", doc_id=doc_id, ordinal=11, content="(1)",
+              pages_json="[2]", blocks_json=json.dumps(_blocks(2, "(1)"))),
+    ])
+    kb.close()
+    d = env["client"].get(f"/api/admin/doc/{doc_id}/fidelity?per_kind=1").json()
+    groups = {g["key"]: g for g in d["groups"]}
+    leak = groups["page_leak"]["items"][0]["leak"]
+    assert leak["value"] == "12" and leak["edge"] == "end"
+    assert [l.get("text") for l in leak["lines"]] == [
+        "Net product sales increased.", "Revenue was flat.", "12"]
+    assert [l.get("mark") for l in leak["lines"]] == [False, False, True]
+    assert groups["empty"]["total"] == 1 and groups["empty"]["items"][0]["page"] == 2
+    assert d["num_chunks"] == 3
+    assert "garbled" not in groups  # only issue kinds that occur are returned

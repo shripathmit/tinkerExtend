@@ -497,65 +497,113 @@ def api_jobs():
 _EDGE_NUM_RE = re.compile(r"^\d{1,4}$")
 
 
-def _problem_excerpts(kb: KnowledgeBase, doc_id: str, limit: int = 3) -> list[dict]:
-    """Up to `limit` chunks that show why a document is flagged."""
-    out: list[dict] = []
-    seen: set[str] = set()
+# Issue kinds in display order, with the key the UI uses for icons/help.
+ISSUE_KINDS = [
+    ("table_shape", "Table shape inconsistent"),
+    ("page_leak", "Page number leaked into body"),
+    ("garbled", "Garbled text"),
+    ("empty", "Empty passage"),
+]
 
-    def add(kind: str, row, text: str | None = None, table: dict | None = None) -> None:
-        if len(out) >= limit or row["chunk_id"] in seen:
+
+def _plain_lines(text: str) -> list[str]:
+    """Non-empty lines of a chunk with markup stripped, whitespace collapsed."""
+    out = []
+    for line in (text or "").splitlines():
+        t = " ".join(TAG_STRIP_RE.sub(" ", line).split())
+        if t:
+            out.append(t)
+    return out
+
+
+def _context_lines(lines: list[str], mark: int, keep: int = 3) -> list[dict]:
+    """The marked line plus `keep` lines of context, with gap markers."""
+    lo, hi = max(0, mark - keep), min(len(lines), mark + keep + 1)
+    out: list[dict] = []
+    if lo > 0:
+        out.append({"gap": lo})
+    out += [{"n": i + 1, "text": lines[i][:240], "mark": i == mark} for i in range(lo, hi)]
+    if hi < len(lines):
+        out.append({"gap": len(lines) - hi})
+    return out
+
+
+def _problem_groups(kb: KnowledgeBase, doc_id: str, per_kind: int = 3) -> list[dict]:
+    """Chunks that show why a document is flagged, grouped by issue.
+
+    Each group: {key, kind, total, items[:per_kind]}. Items carry the chunk,
+    its page, a short plain-text excerpt, and issue-specific detail: the
+    parsed table grid with mismatched rows (table_shape), or the passage's
+    lines with the leaked page number marked (page_leak).
+    """
+    groups = {key: {"key": key, "kind": label, "total": 0, "items": []}
+              for key, label in ISSUE_KINDS}
+
+    def add(key: str, row, extra: dict | None = None, text: str | None = None) -> None:
+        g = groups[key]
+        g["total"] += 1
+        if len(g["items"]) >= per_kind:
             return
-        seen.add(row["chunk_id"])
         try:
             pages = json.loads(row["pages_json"] or "[]")
         except (json.JSONDecodeError, TypeError):
             pages = []
         plain = " ".join(TAG_STRIP_RE.sub(" ", text if text is not None else row["content"]).split())
-        item = {"kind": kind, "chunk_id": row["chunk_id"],
-                "page": pages[0] if pages else None,
-                "text": plain[:320] + ("…" if len(plain) > 320 else "")}
-        if table:
-            # Rows around the first bad one, so the panel can show the table
-            # itself with the short/long rows marked.
-            first_bad = table["bad_rows"][0] if table["bad_rows"] else 0
-            lo = max(0, first_bad - 4)
-            rows = table["rows"][lo:lo + 10]
-            item["table"] = {
-                "rows": [{**r, "bad": (lo + i) in table["bad_rows"], "index": lo + i + 1}
-                         for i, r in enumerate(rows)],
-                "expected_width": table["expected_width"],
-                "bad_count": len(table["bad_rows"]),
-                "total_rows": len(table["rows"]),
-            }
-        out.append(item)
+        g["items"].append({"kind": g["kind"], "chunk_id": row["chunk_id"],
+                           "page": pages[0] if pages else None,
+                           "text": plain[:320] + ("…" if len(plain) > 320 else ""),
+                           **(extra or {})})
 
     rows = kb.conn.execute(
         "SELECT chunk_id, content, blocks_json, pages_json FROM chunks"
         " WHERE doc_id = ? ORDER BY ordinal", (doc_id,)).fetchall()
+    parsed = [(r, json.loads(r["blocks_json"] or "[]")) for r in rows]
     page_nums: set[str] = set()
-    for r in rows:
-        for b in json.loads(r["blocks_json"] or "[]"):
+    for _, blocks in parsed:
+        for b in blocks:
             if isinstance(b, dict) and b.get("type") == "page_number":
                 t = TAG_STRIP_RE.sub(" ", b.get("content") or "").strip()
                 if _EDGE_NUM_RE.match(t):
                     page_nums.add(t)
-    for r in rows:
-        for b in json.loads(r["blocks_json"] or "[]"):
-            if isinstance(b, dict) and b.get("type") == "table" \
-                    and not _table_shape_ok(b.get("content") or ""):
-                add("Table shape inconsistent", r, b.get("content") or "",
-                    table=table_grid(b.get("content") or ""))
+
+    for r, blocks in parsed:
+        for b in blocks:
+            if not (isinstance(b, dict) and b.get("type") == "table"):
+                continue
+            content = b.get("content") or ""
+            if _table_shape_ok(content):
+                continue
+            grid = table_grid(content)
+            # Rows around the first bad one, so the table itself can be
+            # shown with the short/long rows marked.
+            first_bad = grid["bad_rows"][0] if grid["bad_rows"] else 0
+            lo = max(0, first_bad - 4)
+            add("table_shape", r, {"table": {
+                "rows": [{**row, "bad": (lo + i) in grid["bad_rows"], "index": lo + i + 1}
+                         for i, row in enumerate(grid["rows"][lo:lo + 10])],
+                "expected_width": grid["expected_width"],
+                "bad_count": len(grid["bad_rows"]),
+                "total_rows": len(grid["rows"]),
+            }}, text=content)
+
+    for r, _ in parsed:
+        lines = _plain_lines(r["content"])
+        if not lines:
+            continue
+        for idx, edge in ((0, "start"), (len(lines) - 1, "end")):
+            if lines[idx] in page_nums:
+                add("page_leak", r, {"leak": {
+                    "value": lines[idx], "edge": edge,
+                    "lines": _context_lines(lines, idx),
+                }})
                 break
-    for r in rows:
-        lines = TAG_STRIP_RE.sub(" ", r["content"]).strip().splitlines()
-        if lines and {lines[0].strip(), lines[-1].strip()} & page_nums:
-            add("Page number leaked into body", r)
-    for r in rows:
+
+    for r, _ in parsed:
         if _is_garbled(r["content"]):
-            add("Garbled text", r)
+            add("garbled", r)
         elif len(r["content"].strip()) < 20:
-            add("Empty chunk", r)
-    return out
+            add("empty", r)
+    return [g for g in groups.values() if g["total"]]
 
 
 def _source_path(doc: dict) -> str | None:
@@ -583,7 +631,7 @@ def _source_path(doc: dict) -> str | None:
 
 
 @_api.get("/api/admin/doc/{doc_id}/fidelity")
-def api_doc_fidelity(doc_id: str):
+def api_doc_fidelity(doc_id: str, per_kind: int = 3):
     kb = _kb()
     try:
         doc = kb.get_document(doc_id)
@@ -603,7 +651,9 @@ def api_doc_fidelity(doc_id: str):
             "pages": pages,
             "metrics": metrics,
             "flags": red_flags(metrics) if row else [],
-            "excerpts": _problem_excerpts(kb, doc_id),
+            "groups": (groups := _problem_groups(kb, doc_id, per_kind=max(1, min(per_kind, 25)))),
+            "excerpts": [i for g in groups for i in g["items"]][:3],
+            "num_chunks": (row or {}).get("num_chunks") or doc.get("num_chunks") or 0,
             "estimated_cost_usd": round(pages * ENGINE_RATES["parse_performance"], 4),
             "source_available": _source_path(doc) is not None,
             "history": kb.reparse_history(doc_id),

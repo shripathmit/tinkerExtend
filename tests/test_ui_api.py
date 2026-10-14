@@ -204,3 +204,43 @@ def test_reparse_refuses_when_source_missing_or_no_key(env, monkeypatch):
     monkeypatch.setattr(admin, "_client_factory", no_key)
     r = c.post("/api/admin/reparse", json={"doc_ids": [env["doc_id"]]})
     assert r.status_code == 400 and "EXTEND_API_KEY" in r.json()["error"]
+
+
+RAGGED = ("<table><tr><td>a</td><td>b</td><td>c</td></tr><tr><td>d</td><td>e</td><td>f</td></tr>"
+          "<tr><td>g</td><td>h</td></tr><tr><td>i</td><td>j</td><td>k</td></tr></table>")
+
+
+def test_doc_fidelity_explains_checks_with_table_example(env):
+    kb = KnowledgeBase(env["kb_path"])
+    kb.add_chunks([Chunk(chunk_id=f"{env['doc_id']}:00009", doc_id=env["doc_id"], ordinal=9,
+                         content=RAGGED, pages_json="[2]",
+                         blocks_json=json.dumps(_blocks(2, RAGGED, kind="table")))])
+    kb.close()
+    from tinker_extend.admin import recompute_doc_telemetry
+    kb = KnowledgeBase(env["kb_path"])
+    recompute_doc_telemetry(kb, env["doc_id"])
+    kb.close()
+
+    d = env["client"].get(f"/api/admin/doc/{env['doc_id']}/fidelity").json()
+    checks = {c["key"]: c for c in d["checks"]}
+    assert checks["table_shape"]["value"] == "0 of 1 table consistent (0%)"
+    assert checks["table_shape"]["ok"] is False
+    assert d["verdict"].startswith("Tables are the main issue")
+    table_ex = next(x for x in d["excerpts"] if x.get("table"))
+    t = table_ex["table"]
+    assert t["expected_width"] == 3 and t["bad_count"] == 1
+    bad = [r for r in t["rows"] if r["bad"]]
+    assert len(bad) == 1 and bad[0]["index"] == 3 and bad[0]["cells"] == ["g", "h"]
+
+
+def test_fidelity_recompute_runs_once_and_keeps_coverage_without_source(env):
+    kb = KnowledgeBase(env["kb_path"])
+    kb.conn.execute("UPDATE parse_telemetry SET text_coverage = 0.81")
+    kb.conn.commit()
+    kb.close()
+    os.remove(env["src"])  # source PDF no longer on the server
+    assert web.recompute_fidelity_if_changed().startswith("recomputed fidelity for 1 doc")
+    assert web.recompute_fidelity_if_changed().startswith("fidelity metrics current")
+    kb = KnowledgeBase(env["kb_path"])
+    assert kb.telemetry_row(env["doc_id"])["text_coverage"] == 0.81
+    kb.close()

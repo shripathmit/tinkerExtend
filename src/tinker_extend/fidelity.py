@@ -15,8 +15,14 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from collections import Counter
 
 from .chunking import TAG_STRIP_RE as _TAG_STRIP_RE, block_page_number
+
+# Bump when a metric's definition changes; the app recomputes stored
+# metrics once at startup (from stored blocks, no API calls).
+FIDELITY_VERSION = "2"
 
 _REPLACEMENT = "\ufffd"
 _LONG_TOKEN_RE = re.compile(r"\S{60,}")
@@ -37,31 +43,60 @@ def _is_garbled(text: str) -> bool:
     return high > len(plain) * 0.05
 
 
-def _effective_cols(row_html: str) -> int:
-    """Column count of a <tr>, honoring colspan."""
-    total = 0
-    for m in re.finditer(r"<t[dh]([^>]*)>", row_html, re.I):
-        attrs = m.group(1)
-        cs = re.search(r'colspan=["\']?(\d+)', attrs, re.I)
-        total += int(cs.group(1)) if cs else 1
-    return total
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<(t[dh])([^>]*)>(.*?)</t[dh]>", re.S | re.I)
+
+
+def _span(attrs: str, name: str) -> int:
+    m = re.search(name + r'=["\']?(\d+)', attrs, re.I)
+    return max(1, int(m.group(1))) if m else 1
+
+
+def table_grid(content: str) -> dict | None:
+    """Parse an HTML table into rows with effective widths.
+
+    A row's width counts colspan, plus columns still covered by a rowspan
+    cell from a row above. Body rows (no <th>) are expected to agree on
+    width; ``bad_rows`` are the body rows that don't match the most common
+    width. Returns None for non-HTML tables (shape can't be judged).
+    """
+    raw_rows = _ROW_RE.findall(content or "")
+    if not raw_rows:
+        return None
+    carry: list[list[int]] = []  # [rows_remaining, colspan] from rowspans above
+    rows = []
+    for raw in raw_rows:
+        cells, width, new_carry = [], sum(c[1] for c in carry), []
+        is_header = False
+        for tag, attrs, inner in _CELL_RE.findall(raw):
+            cs, rs = _span(attrs, "colspan"), _span(attrs, "rowspan")
+            is_header = is_header or tag.lower() == "th"
+            width += cs
+            cells.append(" ".join(_TAG_STRIP_RE.sub(" ", inner).split()))
+            if rs > 1:
+                new_carry.append([rs - 1, cs])
+        carry = [[n - 1, cs] for n, cs in carry if n > 1] + new_carry
+        rows.append({"cells": cells, "width": width, "header": is_header})
+    body = [i for i, r in enumerate(rows) if not r["header"]]
+    if len(body) < 2:
+        body = list(range(len(rows)))  # tiny table: compare everything
+    widths = Counter(rows[i]["width"] for i in body)
+    expected = widths.most_common(1)[0][0] if widths else 0
+    return {"rows": rows, "expected_width": expected,
+            "bad_rows": [i for i in body if rows[i]["width"] != expected]}
 
 
 def _table_shape_ok(content: str) -> bool:
     """Body rows (non-header) must agree on effective column count.
 
-    Header rows with merged cells (colspan/rowspan) legitimately differ,
-    so only <tr>s without <th> are compared.
+    Header rows with merged cells legitimately differ, so only rows
+    without <th> are compared; colspan and rowspan are both honored.
     """
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", content, re.S | re.I)
-    if not rows:
+    grid = table_grid(content)
+    if grid is None:
         # Non-HTML serialization: can't judge shape, don't penalize.
         return True
-    body = [r for r in rows if "<th" not in r.lower()]
-    if len(body) < 2:
-        body = rows  # tiny table: compare everything
-    widths = {_effective_cols(r) for r in body}
-    return len(widths) == 1 and next(iter(widths)) > 0
+    return not grid["bad_rows"] and grid["expected_width"] > 0
 
 
 _EDGE_NUMBER_RE = re.compile(r"^\d{1,4}$")
@@ -140,34 +175,141 @@ def fidelity_metrics(blocks: list[dict], chunks: list[str]) -> dict:
     }
 
 
+_HYPHEN_BREAK_RE = re.compile(r"([a-z0-9]+)-[ \t]*\n\s*([a-z0-9]+)")
+_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}\b)")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _normalize(text: str) -> str:
+    """Markup stripped, Unicode folded, lowercased, thousands separators
+    dropped, so "$1,382" and "1382" become the same word."""
+    t = unicodedata.normalize("NFKC", _TAG_STRIP_RE.sub(" ", text or "")).lower()
+    return _THOUSANDS_RE.sub("", t)
+
+
 def text_coverage(source_text: str, parsed_text: str) -> float | None:
-    """Fraction of source-text words recovered in the parse output."""
-    src = set((source_text or "").lower().split())
+    """Fraction of the source's distinct words found in the parse output.
+
+    Punctuation and currency are ignored. A word hyphenated across a line
+    break counts as found whether the parse kept the hyphen ("COVID-19")
+    or joined it ("development" from "devel-/opment").
+    """
+    src_text = _normalize(source_text)
+    src = set(_WORD_RE.findall(src_text))
     if not src:
         return None
-    parsed = set((parsed_text or "").lower().split())
-    return len(src & parsed) / len(src)
+    parsed = set(_WORD_RE.findall(_normalize(parsed_text)))
+    found = src & parsed
+    for a, b in _HYPHEN_BREAK_RE.findall(src_text):
+        if a + b in parsed:
+            found |= {a, b}
+    return len(found) / len(src)
+
+
+# Thresholds behind each flag (tune against the corpus).
+THRESHOLDS = {
+    "table_shape_rate": 0.90,
+    "empty_rate": 0.05,
+    "ocr_confidence": 0.85,
+    "text_coverage": 0.95,
+}
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def fidelity_checks(m: dict) -> list[dict]:
+    """Every fidelity check as {key, label, value, threshold, ok, why}.
+
+    ``ok`` is None when the check doesn't apply (no tables, no source PDF).
+    red_flags() is the failing subset as one-line strings.
+    """
+    tables = m.get("table_blocks", 0) or 0
+    tables_ok = m.get("table_shape_ok", 0) or 0
+    shape = tables_ok / tables if tables else None
+    empty, chunks = m.get("empty_chunks", 0) or 0, m.get("num_chunks", 0) or 0
+    empty_rate = m.get("empty_rate")
+    if empty_rate is None:
+        empty_rate = empty / chunks if chunks else 0.0
+    garbled = m.get("garbled_chunks", 0) or 0
+    leaks = m.get("repeated_ngrams", 0) or 0
+    ocr, cov = m.get("ocr_confidence"), m.get("text_coverage")
+    return [
+        {"key": "table_shape", "label": "Table shape",
+         "value": (f"{tables_ok} of {_plural(tables, 'table')} consistent ({shape:.0%})"
+                   if tables else "No tables found"),
+         "threshold": f"≥ {THRESHOLDS['table_shape_rate']:.0%}",
+         "ok": None if not tables else shape >= THRESHOLDS["table_shape_rate"],
+         "why": "A table whose rows have different cell counts usually has merged or "
+                "dropped cells, so figures can land in the wrong column."},
+        {"key": "page_leaks", "label": "Page numbers in text",
+         "value": _plural(leaks, "chunk"), "threshold": "0",
+         "ok": leaks == 0,
+         "why": "A page number at the start or end of a passage can be read as part "
+                "of a figure or sentence."},
+        {"key": "text_coverage", "label": "Text coverage",
+         "value": "Not measured (source PDF not on server)" if cov is None else f"{cov:.1%} of source words",
+         "threshold": f"≥ {THRESHOLDS['text_coverage']:.0%}",
+         "ok": None if cov is None else cov >= THRESHOLDS["text_coverage"],
+         "why": "Words in the PDF that the parse didn't capture can't be searched or cited."},
+        {"key": "empty", "label": "Empty passages",
+         "value": f"{empty} of {_plural(chunks, 'chunk')}",
+         "threshold": f"≤ {THRESHOLDS['empty_rate']:.0%}",
+         "ok": empty_rate <= THRESHOLDS["empty_rate"],
+         "why": "Near-empty passages add noise to search without adding content."},
+        {"key": "garbled", "label": "Garbled text",
+         "value": _plural(garbled, "chunk"), "threshold": "0",
+         "ok": garbled == 0,
+         "why": "Broken characters usually mean an encoding or OCR failure."},
+        {"key": "ocr", "label": "OCR confidence",
+         "value": "Not a scan" if ocr is None else f"{ocr:.2f}",
+         "threshold": f"≥ {THRESHOLDS['ocr_confidence']:.2f}",
+         "ok": None if ocr is None else ocr >= THRESHOLDS["ocr_confidence"],
+         "why": "Low OCR confidence means the page was read from an image and may "
+                "contain misread characters."},
+        {"key": "pages", "label": "Page numbers present",
+         "value": "Yes" if (m.get("num_pages") or 0) else "No",
+         "threshold": "Yes", "ok": bool(m.get("num_pages")),
+         "why": "Without page numbers, answers can't point to where they came from."},
+    ]
+
+
+_FLAG_TEXT = {
+    "table_shape": lambda m: (f"table shape inconsistent ({m['table_shape_ok']} of "
+                              f"{_plural(m['table_blocks'], 'table')} ok)"),
+    "page_leaks": lambda m: f"page numbers leaked into body text ({_plural(m['repeated_ngrams'], 'chunk')})",
+    "text_coverage": lambda m: f"low text coverage vs source ({m['text_coverage']:.0%})",
+    "empty": lambda m: f"high empty-chunk rate ({m.get('empty_rate') or 0:.0%})",
+    "garbled": lambda m: f"garbled text ({_plural(m['garbled_chunks'], 'chunk')})",
+    "ocr": lambda m: f"low OCR confidence ({m['ocr_confidence']:.2f}) — likely scan",
+    "pages": lambda m: "no page numbers in parse output",
+}
 
 
 def red_flags(m: dict) -> list[str]:
     """Human-readable flags for a fidelity-metrics dict."""
-    flags = []
-    if m.get("empty_rate", 0) > 0.05:
-        flags.append(f"high empty-chunk rate ({m['empty_rate']:.0%})")
-    if m.get("garbled_rate", 0) > 0:
-        flags.append(f"garbled chunks detected ({m['garbled_chunks']})")
-    if m.get("table_shape_rate", 1) < 0.9:
-        flags.append(f"table shape inconsistent ({m['table_shape_rate']:.0%} ok)")
-    if m.get("num_pages", 0) == 0:
-        flags.append("no page numbers in parse output")
-    if (m.get("ocr_confidence") or 1.0) < 0.85:
-        flags.append(f"low OCR confidence ({m['ocr_confidence']:.2f}) — likely scan")
-    if m.get("repeated_ngrams", 0) > 0:
-        flags.append(f"page numbers leaked into body text ({m['repeated_ngrams']} chunks)")
-    cov = m.get("text_coverage")
-    if cov is not None and cov < 0.95:
-        flags.append(f"low text coverage vs source ({cov:.0%})")
-    return flags
+    full = {"table_blocks": 0, "table_shape_ok": 0, "repeated_ngrams": 0,
+            "garbled_chunks": 0, **m}
+    return [_FLAG_TEXT[c["key"]](full) for c in fidelity_checks(full) if c["ok"] is False]
+
+
+def fidelity_verdict(m: dict, pages: int, rate: float) -> str:
+    """One plain sentence: what matters most and whether to re-parse."""
+    failing = {c["key"] for c in fidelity_checks(m) if c["ok"] is False}
+    cost = f"${pages * rate:.2f}"
+    if not failing:
+        return "Clean parse. No re-parse needed."
+    if failing & {"table_shape", "ocr", "garbled"}:
+        main = ("Tables are the main issue" if "table_shape" in failing
+                else "Text quality is the main issue")
+        return (f"{main}. The Performance engine handles tables and scans better, "
+                f"so a re-parse is likely worth {cost}.")
+    if failing == {"text_coverage"}:
+        return ("Only coverage is low. Check the examples first: it can be "
+                f"under-counted on slides and tables. Re-parse ({cost}) is optional.")
+    return (f"Minor issues ({', '.join(sorted(failing)).replace('_', ' ')}). "
+            f"Re-parse ({cost}) is optional.")
 
 
 def check_golden_doc(spec: dict, chunks_text: str) -> dict:

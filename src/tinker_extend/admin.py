@@ -22,8 +22,8 @@ from .embeddings import embedder_from_env
 from .extend_client import ExtendClient
 from .chunking import TAG_STRIP_RE, block_page_number
 from .fidelity import (
-    _is_garbled, _table_shape_ok, check_golden_doc, fidelity_metrics,
-    load_golden_docs, red_flags,
+    _is_garbled, _table_shape_ok, check_golden_doc, fidelity_checks,
+    fidelity_metrics, fidelity_verdict, load_golden_docs, red_flags, table_grid,
 )
 from .ingest import SUPPORTED_EXTENSIONS, iter_candidate_files, sha256_file
 from .pages import resolve_pdf
@@ -404,7 +404,7 @@ def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:
     Wave/engine/cost/duration are preserved.
     """
     doc = kb.conn.execute(
-        "SELECT doc_id, source FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+        "SELECT doc_id, source, file_hash FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
     if not doc:
         return None
     blocks: list = []
@@ -418,8 +418,8 @@ def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:
             pass
     metrics = fidelity_metrics(blocks, chunks)
     # Coverage when the source file is still around (uploads dir / seed dir).
-    src = doc["source"]
-    if src and os.path.exists(src):
+    src = _source_path(dict(doc))
+    if src:
         try:
             from pypdf import PdfReader
             text = "\n".join((p.extract_text() or "") for p in PdfReader(src).pages)
@@ -428,6 +428,12 @@ def recompute_doc_telemetry(kb: KnowledgeBase, doc_id: str) -> dict | None:
                 metrics["text_coverage"] = _tc(text, "\n".join(chunks))
         except Exception:
             pass
+    if "text_coverage" not in metrics:
+        # Source PDF not on this server: keep the coverage measured at ingest
+        # rather than erasing it.
+        prev = kb.telemetry_row(doc_id)
+        if prev and prev.get("text_coverage") is not None:
+            metrics["text_coverage"] = prev["text_coverage"]
     kb.update_telemetry_metrics(doc_id, metrics)
     return {"doc_id": doc_id, "metrics": metrics,
             "flags": red_flags(metrics)}
@@ -496,7 +502,7 @@ def _problem_excerpts(kb: KnowledgeBase, doc_id: str, limit: int = 3) -> list[di
     out: list[dict] = []
     seen: set[str] = set()
 
-    def add(kind: str, row, text: str | None = None) -> None:
+    def add(kind: str, row, text: str | None = None, table: dict | None = None) -> None:
         if len(out) >= limit or row["chunk_id"] in seen:
             return
         seen.add(row["chunk_id"])
@@ -505,9 +511,23 @@ def _problem_excerpts(kb: KnowledgeBase, doc_id: str, limit: int = 3) -> list[di
         except (json.JSONDecodeError, TypeError):
             pages = []
         plain = " ".join(TAG_STRIP_RE.sub(" ", text if text is not None else row["content"]).split())
-        out.append({"kind": kind, "chunk_id": row["chunk_id"],
-                    "page": pages[0] if pages else None,
-                    "text": plain[:320] + ("…" if len(plain) > 320 else "")})
+        item = {"kind": kind, "chunk_id": row["chunk_id"],
+                "page": pages[0] if pages else None,
+                "text": plain[:320] + ("…" if len(plain) > 320 else "")}
+        if table:
+            # Rows around the first bad one, so the panel can show the table
+            # itself with the short/long rows marked.
+            first_bad = table["bad_rows"][0] if table["bad_rows"] else 0
+            lo = max(0, first_bad - 4)
+            rows = table["rows"][lo:lo + 10]
+            item["table"] = {
+                "rows": [{**r, "bad": (lo + i) in table["bad_rows"], "index": lo + i + 1}
+                         for i, r in enumerate(rows)],
+                "expected_width": table["expected_width"],
+                "bad_count": len(table["bad_rows"]),
+                "total_rows": len(table["rows"]),
+            }
+        out.append(item)
 
     rows = kb.conn.execute(
         "SELECT chunk_id, content, blocks_json, pages_json FROM chunks"
@@ -523,7 +543,8 @@ def _problem_excerpts(kb: KnowledgeBase, doc_id: str, limit: int = 3) -> list[di
         for b in json.loads(r["blocks_json"] or "[]"):
             if isinstance(b, dict) and b.get("type") == "table" \
                     and not _table_shape_ok(b.get("content") or ""):
-                add("Table shape inconsistent", r, b.get("content") or "")
+                add("Table shape inconsistent", r, b.get("content") or "",
+                    table=table_grid(b.get("content") or ""))
                 break
     for r in rows:
         lines = TAG_STRIP_RE.sub(" ", r["content"]).strip().splitlines()
@@ -574,6 +595,9 @@ def api_doc_fidelity(doc_id: str):
         return {
             "doc_id": doc_id,
             "name": os.path.basename(doc["source"]),
+            "checks": fidelity_checks(metrics) if row else [],
+            "verdict": (fidelity_verdict(metrics, pages, ENGINE_RATES["parse_performance"])
+                        if row else "No fidelity metrics recorded for this document yet."),
             "doc_type": (row or {}).get("doc_type", ""),
             "engine": (row or {}).get("engine", ""),
             "pages": pages,

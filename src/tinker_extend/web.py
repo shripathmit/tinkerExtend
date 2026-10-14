@@ -166,6 +166,23 @@ def backfill_telemetry() -> str:
         kb.close()
 
 
+def recompute_fidelity_if_changed() -> str:
+    """Re-run fidelity checks on stored blocks when their definition changed."""
+    from .admin import recompute_doc_telemetry
+    from .fidelity import FIDELITY_VERSION
+    kb = get_kb()
+    try:
+        if kb.get_meta("fidelity_version") == FIDELITY_VERSION:
+            return f"fidelity metrics current (v{FIDELITY_VERSION})"
+        ids = [r[0] for r in kb.conn.execute("SELECT doc_id FROM parse_telemetry")]
+        for doc_id in ids:
+            recompute_doc_telemetry(kb, doc_id)
+        kb.set_meta("fidelity_version", FIDELITY_VERSION)
+        return f"recomputed fidelity for {len(ids)} doc(s) (v{FIDELITY_VERSION})"
+    finally:
+        kb.close()
+
+
 def backfill_vectors() -> str:
     """Embed chunks stored before embeddings existed (or under another model)."""
     embedder = embedder_from_env()
@@ -188,6 +205,7 @@ async def lifespan(app: FastAPI):
     print("tinkerExtend boot:", seed_if_empty(), flush=True)
     print("tinkerExtend boot:", ensure_page_images(), flush=True)
     print("tinkerExtend boot:", backfill_telemetry(), flush=True)
+    print("tinkerExtend boot:", recompute_fidelity_if_changed(), flush=True)
     print("tinkerExtend boot:", backfill_vectors(), flush=True)
     yield
 

@@ -817,70 +817,114 @@ async function onReparseAll() {
   }
 }
 
-function metricLines(m) {
-  if (!m || m.num_chunks == null) return '<div class="text-inkFaint">No metrics recorded.</div>';
-  const shape = m.num_tables ? `${m.table_shape_ok}/${m.num_tables}` : 'n/a';
-  return `
-    <div class="flex justify-between"><span>Table shape</span><span class="text-ink">${shape}</span></div>
-    <div class="flex justify-between"><span>Page leaks</span><span class="text-ink">${m.repeated_ngrams ?? 0} chunks</span></div>
-    <div class="flex justify-between"><span>Text coverage</span><span class="text-ink">${m.text_coverage == null ? 'n/a' : pct(m.text_coverage)}</span></div>
-    <div class="flex justify-between"><span>Empty / garbled</span><span class="text-ink">${m.empty_chunks ?? 0} / ${m.garbled_chunks ?? 0}</span></div>
-    <div class="flex justify-between"><span>Chunks · pages</span><span class="text-ink">${m.num_chunks} · ${m.num_pages}</span></div>`;
+const CHECK_MARK = {
+  true: '<span class="text-emeraldOk" aria-label="pass">✓</span>',
+  false: '<span class="text-amberWarn" aria-label="fail">!</span>',
+  null: '<span class="text-inkFaint" aria-label="not applicable">–</span>',
+};
+
+function renderChecks(checks) {
+  // Failing checks first, then passing, then not applicable.
+  const order = (c) => (c.ok === false ? 0 : c.ok === true ? 1 : 2);
+  return [...checks].sort((a, b) => order(a) - order(b)).map((c) => `
+    <div class="py-3 grid grid-cols-[1rem_1fr_auto] gap-x-3 items-baseline">
+      <span class="font-mono text-xs">${CHECK_MARK[c.ok]}</span>
+      <div class="min-w-0">
+        <div class="text-xs ${c.ok === false ? 'text-ink' : 'text-inkMuted'}">${esc(c.label)}</div>
+        ${c.ok === false ? `<div class="text-[11px] text-inkFaint leading-relaxed mt-1">${esc(c.why)}</div>` : ''}
+      </div>
+      <div class="text-right font-mono text-xs whitespace-nowrap">
+        <div class="${c.ok === false ? 'text-amberWarn' : 'text-inkMuted'}">${esc(c.value)}</div>
+        <div class="text-[11px] text-inkFaint mt-0.5">${c.ok === null ? '' : `target ${esc(c.threshold)}`}</div>
+      </div>
+    </div>`).join('');
 }
+
+function renderTableExample(t) {
+  const maxCells = Math.max(...t.rows.map((r) => r.cells.length), t.expected_width);
+  const firstBad = t.rows.find((r) => r.bad);
+  const caption = firstBad
+    ? `Row ${firstBad.index} has ${firstBad.width} column${firstBad.width === 1 ? '' : 's'}; the table's other rows have ${t.expected_width}. ${t.bad_count} of ${t.total_rows} rows don't match.`
+    : `${t.bad_count} of ${t.total_rows} rows don't match the table's ${t.expected_width} columns.`;
+  const rows = t.rows.map((r) => {
+    const cells = r.cells.map((c) => `<td class="px-2 py-1 border-b border-hairline align-top">${esc(c.length > 40 ? c.slice(0, 38) + '…' : c)}</td>`).join('');
+    const pad = '<td class="px-2 py-1 border-b border-hairline"></td>'.repeat(Math.max(0, maxCells - r.cells.length));
+    const cls = r.bad ? 'bg-amberWarn/10 text-ink' : r.header ? 'text-inkFaint' : 'text-inkMuted';
+    const mark = r.bad ? `<span class="text-amberWarn">${r.width}≠${t.expected_width}</span>` : '';
+    return `<tr class="${cls}"><td class="pr-2 py-1 border-b border-hairline text-inkFaint text-right">${r.index}</td>${cells}${pad}<td class="pl-2 py-1 border-b border-hairline text-right whitespace-nowrap">${mark}</td></tr>`;
+  }).join('');
+  return `
+    <p class="text-xs text-inkMuted leading-relaxed">${esc(caption)}</p>
+    <div class="overflow-x-auto border border-hairline bg-surface">
+      <table class="w-full font-mono text-[11px] tabular-nums border-collapse">${rows}</table>
+    </div>`;
+}
+
+const EXAMPLE_HELP = {
+  'Page number leaked into body': 'The number at the start or end of this passage is the page number, not content.',
+  'Empty chunk': 'This passage has almost no text.',
+  'Garbled text': 'This passage contains broken characters.',
+};
 
 async function openDiffSheet(docId) {
   state.diff = { docId, job: null };
   $('diff-sheet-backdrop').classList.remove('hidden');
   $('diff-doc-title').textContent = 'Loading…';
-  $('diff-left').innerHTML = ''; $('diff-right').innerHTML = '';
+  ['diff-verdict', 'diff-checks', 'diff-examples', 'diff-right', 'diff-cost'].forEach((id) => { $(id).innerHTML = ''; });
   $('diff-close').focus();
   try {
     renderDiff(await api(`/api/admin/doc/${encodeURIComponent(docId)}/fidelity`));
   } catch (e) {
-    if (!(e instanceof LockedError)) $('diff-issue-summary').textContent = e.message;
+    if (!(e instanceof LockedError)) $('diff-verdict').textContent = e.message;
   }
 }
 
 function renderDiff(d) {
   $('diff-doc-title').textContent = d.name;
-  $('diff-issue-summary').textContent = d.flags.length
-    ? d.flags.join(' · ')
-    : 'Clean parse · no structural anomalies detected.';
-  $('diff-left-label').textContent = `Current (${engineLabel(d.engine)})`;
-  $('diff-left-status').innerHTML = d.flags.length ? '<span class="text-amberWarn">Warning</span>' : '<span class="text-emeraldOk">Clean</span>';
-  const excerpts = d.excerpts.length ? d.excerpts.map((x) => `
-    <div class="space-y-1">
-      <div class="text-ink">${esc(x.kind)}${x.page != null ? ` · p.${x.page}` : ''}</div>
-      <div class="p-2 bg-amberWarn/10 border-l-2 border-amberWarn text-ink break-words">${esc(x.text || '(empty)')}</div>
-    </div>`).join('') : '';
-  $('diff-left').innerHTML = metricLines(d.metrics) + (excerpts ? `<div class="pt-3 border-t border-hairline space-y-3">${excerpts}</div>` : '');
+  $('diff-verdict').textContent = d.verdict;
+  $('diff-engine').textContent = `Parsed with ${engineLabel(d.engine)} engine · ${d.pages} page${d.pages === 1 ? '' : 's'}`;
+  $('diff-checks').innerHTML = renderChecks(d.checks || []);
+
+  $('diff-examples-section').classList.toggle('hidden', !d.excerpts.length);
+  $('diff-examples').innerHTML = d.excerpts.map((x) => `
+    <div class="space-y-2">
+      <div class="text-xs font-mono text-ink">${esc(x.kind)}${x.page != null ? ` <span class="text-inkFaint">· page ${x.page}</span>` : ''}</div>
+      ${x.table ? renderTableExample(x.table) : `
+        ${EXAMPLE_HELP[x.kind] ? `<p class="text-xs text-inkMuted">${esc(EXAMPLE_HELP[x.kind])}</p>` : ''}
+        <div class="p-3 bg-surface border-l-2 border-amberWarn font-mono text-xs text-ink leading-relaxed break-words">${esc(x.text || '(empty)')}</div>`}
+    </div>`).join('');
 
   const last = d.history[0];
   const btn = $('diff-reparse');
   if (last) {
     const before = last.before || {};
     const after = last.after || {};
-    const delta = (k, better) => {
-      const b = before[k], a = after[k];
-      if (b == null || a == null || b === a) return '';
-      const good = better === 'down' ? a < b : a > b;
-      return ` <span class="${good ? 'text-emeraldOk' : 'text-amberWarn'}">${good ? '▲' : '▼'}</span>`;
+    const row = (label, b, a, better) => {
+      let mark = '';
+      if (b != null && a != null && b !== a && better) {
+        const good = better === 'down' ? a < b : a > b;
+        mark = ` <span class="${good ? 'text-emeraldOk' : 'text-amberWarn'}">${good ? 'better' : 'worse'}</span>`;
+      }
+      return `<div class="flex justify-between gap-4"><span>${label}</span><span class="text-ink text-right">${b ?? '—'} → ${a ?? '—'}${mark}</span></div>`;
     };
+    const tables = (r) => (r.num_tables ? `${r.table_shape_ok}/${r.num_tables}` : 'none');
+    const cov = (r) => (r.text_coverage == null ? 'n/a' : pct(r.text_coverage));
     $('diff-right-label').textContent = `Before → after (${engineLabel(last.engine)})`;
-    $('diff-right-status').innerHTML = `<span class="text-inkFaint">${esc(new Date(last.at).toLocaleString())}</span>`;
-    $('diff-right').innerHTML = `
-      <div class="flex justify-between"><span>Page leaks</span><span class="text-ink">${before.repeated_ngrams ?? '—'} → ${after.repeated_ngrams ?? '—'}${delta('repeated_ngrams', 'down')}</span></div>
-      <div class="flex justify-between"><span>Tables ok</span><span class="text-ink">${before.table_shape_ok ?? '—'}/${before.num_tables ?? '—'} → ${after.table_shape_ok ?? '—'}/${after.num_tables ?? '—'}</span></div>
-      <div class="flex justify-between"><span>Text coverage</span><span class="text-ink">${before.text_coverage == null ? 'n/a' : pct(before.text_coverage)} → ${after.text_coverage == null ? 'n/a' : pct(after.text_coverage)}${delta('text_coverage', 'up')}</span></div>
-      <div class="flex justify-between"><span>Empty chunks</span><span class="text-ink">${before.empty_chunks ?? '—'} → ${after.empty_chunks ?? '—'}${delta('empty_chunks', 'down')}</span></div>
-      <div class="flex justify-between"><span>Chunks</span><span class="text-ink">${before.num_chunks ?? '—'} → ${after.num_chunks ?? '—'}</span></div>
-      <div class="flex justify-between"><span>Cost</span><span class="text-ink">${money(last.cost_usd)}</span></div>`;
+    $('diff-right-status').innerHTML = `<span class="text-xs font-mono text-inkFaint">${esc(new Date(last.at).toLocaleString())}</span>`;
+    $('diff-right').innerHTML = [
+      row('Consistent tables', tables(before), tables(after)),
+      row('Page numbers in text', before.repeated_ngrams, after.repeated_ngrams, 'down'),
+      row('Text coverage', cov(before), cov(after)),
+      row('Empty passages', before.empty_chunks, after.empty_chunks, 'down'),
+      row('Chunks', before.num_chunks, after.num_chunks),
+      `<div class="flex justify-between gap-4"><span>Cost</span><span class="text-ink">${money(last.cost_usd)}</span></div>`,
+    ].join('');
   } else {
-    $('diff-right-label').textContent = 'Performance Engine';
-    $('diff-right-status').innerHTML = '<span class="text-inkFaint">Not run yet</span>';
+    $('diff-right-label').textContent = 'Performance engine';
+    $('diff-right-status').innerHTML = '<span class="text-xs font-mono text-inkFaint">Not run yet</span>';
     $('diff-right').innerHTML = `
       <p>Re-parses this document with Extend's <span class="text-ink">parse_performance</span> engine, which is stronger on tables, scans and multi-column layouts.</p>
-      <p>Replaces the document's chunks, vectors and fidelity metrics. The current metrics are kept so this panel can show before → after.</p>`;
+      <p>Replaces the document's passages, vectors and checks. The current numbers are kept, so this section then shows before → after.</p>`;
   }
   $('diff-cost').textContent = `Estimated cost: ${money(d.estimated_cost_usd)} (${d.pages} page${d.pages === 1 ? '' : 's'} × $${PERF_RATE})`;
   btn.disabled = !d.source_available;

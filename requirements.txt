@@ -1,10 +1,14 @@
-# Runtime: stdlib only for the pipeline; FastAPI for the web UI.
+# Runtime: stdlib + numpy for the pipeline; FastAPI for the web UI.
 fastapi>=0.110
 python-multipart>=0.0.9
 pypdf>=4.0
 uvicorn>=0.29
 # Page rendering for the source viewer (trust UI).
 pymupdf>=1.24
+# Local embeddings for hybrid search (ONNX, no torch). Downloads
+# BAAI/bge-small-en-v1.5 (~67MB) on first use; see TINKER_EMBED_CACHE.
+fastembed==0.9.0
+numpy>=1.26
 
 # The official Extend SDK is optional — tinker_extend talks to the REST API directly.
 # Uncomment for ad-hoc exploration:

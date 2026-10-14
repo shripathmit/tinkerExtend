@@ -3,7 +3,7 @@
 A document-ingestion pipeline that turns a folder of documents into a searchable
 knowledge base, powered by the [Extend](https://www.extend.ai) document-processing API.
 
-Pipeline: **collect → upload → parse (Extend) → normalize chunks → SQLite FTS knowledge base → query**
+Pipeline: **collect → upload → parse (Extend) → normalize chunks → embed → SQLite knowledge base (FTS + vectors) → hybrid query**
 
 ## Setup
 
@@ -47,9 +47,34 @@ python -m tinker_extend.cli stats --db ./kb.sqlite3
   into KB records, with optional token-window re-chunking.
 - `store.py` — SQLite knowledge base: `documents` and `chunks` tables plus an
   FTS5 full-text index, so `query` works with zero extra infrastructure.
-- `embeddings.py` — pluggable embedder interface. Ships with a null embedder;
-  add your provider to enable vector search later.
+- `embeddings.py` — local embedding model (fastembed, `BAAI/bge-small-en-v1.5`)
+  behind a pluggable interface; falls back to keyword-only search if disabled.
 - `pipeline.py` — orchestration with content-hash delta updates.
+
+## Hybrid search — keywords + embeddings
+
+Every chunk is embedded with a small local model (no API key, no per-call
+cost) and stored as a vector next to the text. A query runs both full-text
+search (exact figures, rare terms) and vector search (paraphrases, synonyms),
+then merges the two rankings with reciprocal rank fusion.
+
+- The model downloads from HuggingFace on first use (~67MB). Point
+  `TINKER_EMBED_CACHE` at a persistent volume so redeploys reuse it.
+- Documents ingested before embeddings existed are backfilled automatically
+  when the web app starts, or on demand: `python -m tinker_extend.cli embed-backfill`.
+- Changing `TINKER_EMBED_MODEL` makes old vectors stale; they are ignored
+  until the backfill re-embeds them.
+- A question is answered only if the top passage shares key terms with it
+  or its vector similarity is at least `TINKER_MIN_SIM` (default 0.80);
+  otherwise the system says it couldn't find an answer.
+- `TINKER_EMBEDDINGS=off` turns it all off (keyword search only).
+
+Compare the two modes on the golden set (also shown in `/admin` → Golden Sets):
+
+```bash
+python -m tinker_extend.cli --db ./kb.sqlite3 eval --eval-file eval/golden_10q.jsonl --compare
+python -m tinker_extend.cli query "How much did R&D spending fall?" --keyword-only
+```
 
 ## Web UI — search and Q&A
 
@@ -98,4 +123,5 @@ a drop in hit_rate or abstention is a regression.
 
 ```bash
 python -m pytest tests/ -q
+TINKER_TEST_REAL_EMBED=1 python -m pytest tests/test_embeddings.py -q   # also downloads + tests the real model
 ```

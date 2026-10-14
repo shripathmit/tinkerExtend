@@ -4,8 +4,21 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
+
+import numpy as np
 
 from .models import Chunk, Document
+
+# Reciprocal rank fusion constant and per-retriever candidate depth.
+RRF_K = 60
+HYBRID_DEPTH = 50
+
+# In-process vector cache: (db path, model) -> (vectors_rev, chunk_ids, matrix).
+# The web app opens a KnowledgeBase per request, so the cache lives at module
+# level and is invalidated by the kb_meta.vectors_rev counter.
+_VEC_CACHE: dict[tuple[str, str], tuple[int, list[str], np.ndarray]] = {}
+_VEC_CACHE_LOCK = threading.Lock()
 
 
 STOPWORDS = frozenset(
@@ -53,7 +66,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   blocks_json    TEXT NOT NULL DEFAULT '[]',
   pages_json     TEXT NOT NULL DEFAULT '[]',
   token_estimate INTEGER NOT NULL DEFAULT 0,
-  embedding_json TEXT
+  embedding_json TEXT,           -- legacy, unused
+  embedding      BLOB,           -- normalized float32 vector
+  embedding_model TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id, content);
 CREATE TABLE IF NOT EXISTS parse_telemetry (
@@ -92,6 +107,10 @@ CREATE TABLE IF NOT EXISTS waves (
   created_at   TEXT NOT NULL,
   completed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS kb_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS feedback (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at   TEXT NOT NULL,
@@ -120,6 +139,23 @@ class KnowledgeBase:
         if "doc_type" not in cols:
             self.conn.execute("ALTER TABLE documents ADD COLUMN doc_type TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
+        ccols = {r[1] for r in self.conn.execute("PRAGMA table_info(chunks)")}
+        for name, decl in (("embedding", "BLOB"), ("embedding_model", "TEXT")):
+            if name not in ccols:
+                self.conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {decl}")
+        self.conn.commit()
+
+    # -- vector revision (cache invalidation) ------------------------------
+    def _bump_vectors_rev(self) -> None:
+        """Mark stored vectors as changed. Call inside the writing transaction."""
+        self.conn.execute(
+            "INSERT INTO kb_meta (key, value) VALUES ('vectors_rev', '1')"
+            " ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1")
+
+    def vectors_rev(self) -> int:
+        row = self.conn.execute(
+            "SELECT value FROM kb_meta WHERE key = 'vectors_rev'").fetchone()
+        return int(row[0]) if row else 0
 
     def close(self) -> None:
         self.conn.close()
@@ -150,16 +186,17 @@ class KnowledgeBase:
                 self.conn.execute(
                     """INSERT INTO chunks
                        (chunk_id, doc_id, ordinal, content, blocks_json, pages_json,
-                        token_estimate, embedding_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        token_estimate, embedding, embedding_model)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(chunk_id) DO UPDATE SET
                          content=excluded.content, blocks_json=excluded.blocks_json,
                          pages_json=excluded.pages_json,
                          token_estimate=excluded.token_estimate,
-                         embedding_json=excluded.embedding_json""",
+                         embedding=excluded.embedding,
+                         embedding_model=excluded.embedding_model""",
                     (
                         c.chunk_id, c.doc_id, c.ordinal, c.content, c.blocks_json,
-                        c.pages_json, c.token_estimate, c.embedding_json,
+                        c.pages_json, c.token_estimate, c.embedding, c.embedding_model,
                     ),
                 )
                 # FTS5 has no UPSERT: delete then re-insert.
@@ -175,6 +212,7 @@ class KnowledgeBase:
                     "UPDATE documents SET num_chunks = ? WHERE doc_id = ?",
                     (len(chunks), chunks[0].doc_id),
                 )
+                self._bump_vectors_rev()
 
     def replace_chunks(self, doc_id: str, chunks: list[Chunk]) -> None:
         """Replace all chunks of a document (used on re-ingest)."""
@@ -187,6 +225,7 @@ class KnowledgeBase:
             for cid in old_ids:
                 self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (cid,))
             self.conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            self._bump_vectors_rev()
         self.add_chunks(chunks)
 
     def delete_document(self, doc_id: str) -> None:
@@ -200,6 +239,32 @@ class KnowledgeBase:
                 self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (cid,))
             self.conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
             self.conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            self._bump_vectors_rev()
+
+    def set_embeddings(self, rows: list[tuple[str, bytes, str]]) -> None:
+        """Store (chunk_id, embedding blob, model) for existing chunks."""
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE chunks SET embedding = ?, embedding_model = ? WHERE chunk_id = ?",
+                [(blob, model, cid) for cid, blob, model in rows])
+            self._bump_vectors_rev()
+
+    def chunks_needing_embedding(self, model: str, limit: int = 256) -> list[dict]:
+        """Chunks with no vector, or a vector from a different model."""
+        rows = self.conn.execute(
+            "SELECT chunk_id, content FROM chunks"
+            " WHERE embedding IS NULL OR embedding_model IS NOT ?"
+            " ORDER BY chunk_id LIMIT ?", (model, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def embedding_stats(self, model: str | None) -> dict:
+        total = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        embedded = self.conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND embedding_model IS ?",
+            (model,)).fetchone()[0] if model else 0
+        return {"model": model, "embedded": embedded, "chunks": total}
 
     # -- reads -----------------------------------------------------------
     def has_hash(self, file_hash: str) -> bool:
@@ -224,7 +289,7 @@ class KnowledgeBase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
+    def keyword_search(self, query: str, limit: int = 10) -> list[dict]:
         """Strict AND over significant terms first; OR fallback if empty.
 
         AND keeps unanswerable questions answerless (so the QA layer can
@@ -238,13 +303,99 @@ class KnowledgeBase:
             hits = self._fts(" OR ".join(terms), limit)
         return hits
 
+    def _vector_matrix(self, model: str) -> tuple[list[str], np.ndarray]:
+        """All chunk vectors for `model`, cached until vectors_rev changes."""
+        key = (self.path, model)
+        rev = self.vectors_rev()
+        if self.path != ":memory:":
+            with _VEC_CACHE_LOCK:
+                hit = _VEC_CACHE.get(key)
+                if hit and hit[0] == rev:
+                    return hit[1], hit[2]
+        rows = self.conn.execute(
+            "SELECT chunk_id, embedding FROM chunks"
+            " WHERE embedding IS NOT NULL AND embedding_model = ?", (model,)).fetchall()
+        ids = [r[0] for r in rows]
+        matrix = (np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in rows])
+                  if rows else np.zeros((0, 0), dtype=np.float32))
+        if self.path != ":memory:":
+            with _VEC_CACHE_LOCK:
+                _VEC_CACHE[key] = (rev, ids, matrix)
+        return ids, matrix
+
+    def vector_search(self, query_vec, model: str, limit: int = 10) -> list[tuple[str, float]]:
+        """(chunk_id, cosine) for the nearest chunks; vectors are normalized."""
+        ids, matrix = self._vector_matrix(model)
+        if not ids:
+            return []
+        q = np.asarray(query_vec, dtype=np.float32)
+        if matrix.shape[1] != q.shape[0]:
+            return []
+        scores = matrix @ q
+        top = np.argsort(-scores)[:limit]
+        return [(ids[i], float(scores[i])) for i in top]
+
+    def _rows_for(self, chunk_ids: list[str]) -> dict[str, dict]:
+        if not chunk_ids:
+            return {}
+        marks = ",".join("?" * len(chunk_ids))
+        rows = self.conn.execute(
+            f"""SELECT c.chunk_id, c.doc_id, c.ordinal, c.content,
+                       c.pages_json, c.token_estimate, d.source AS doc_source
+                FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
+                WHERE c.chunk_id IN ({marks})""", chunk_ids).fetchall()
+        return {r["chunk_id"]: dict(r) for r in rows}
+
+    def search(self, query: str, limit: int = 10, query_vec=None,
+               model: str | None = None) -> list[dict]:
+        """Keyword search, or hybrid keyword + vector search when a query
+        vector is given, merged by reciprocal rank fusion.
+
+        Hybrid rows keep the keyword row shape plus ``vector_score`` (cosine,
+        or None if the chunk was found by keywords only) and ``match``
+        ("keyword", "vector" or "both").
+        """
+        if query_vec is None or not model:
+            return self.keyword_search(query, limit)
+        kw = self.keyword_search(query, HYBRID_DEPTH)
+        vec = self.vector_search(query_vec, model, HYBRID_DEPTH)
+        if not vec:
+            return kw[:limit]
+        fused: dict[str, float] = {}
+        for rank, h in enumerate(kw, start=1):
+            fused[h["chunk_id"]] = fused.get(h["chunk_id"], 0.0) + 1.0 / (RRF_K + rank)
+        for rank, (cid, _) in enumerate(vec, start=1):
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        order = sorted(fused, key=lambda c: -fused[c])[:limit]
+        kw_rows = {h["chunk_id"]: h for h in kw}
+        vec_scores = dict(vec)
+        extra = self._rows_for([c for c in order if c not in kw_rows])
+        out = []
+        for cid in order:
+            row = kw_rows.get(cid)
+            if row is None:
+                row = extra.get(cid)
+                if row is None:
+                    continue
+                text = " ".join(row["content"].split())
+                row = {**row, "snippet": text[:200] + ("…" if len(text) > 200 else ""),
+                       "fts_rank": None}
+            in_kw, in_vec = cid in kw_rows, cid in vec_scores
+            out.append({**row, "vector_score": vec_scores.get(cid),
+                        "match": "both" if in_kw and in_vec else "keyword" if in_kw else "vector",
+                        "rrf_score": fused[cid]})
+        return out
+
     def stats(self) -> dict:
         docs = self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         chunks = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         tokens = self.conn.execute(
             "SELECT COALESCE(SUM(token_estimate), 0) FROM chunks"
         ).fetchone()[0]
-        return {"documents": docs, "chunks": chunks, "token_estimate": tokens}
+        embedded = self.conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+        return {"documents": docs, "chunks": chunks, "token_estimate": tokens,
+                "embedded_chunks": embedded}
 
     def add_feedback(self, question: str, answer_mode: str, answer: str,
                      chunk_ids: list, rating: int, comment: str = "") -> int:

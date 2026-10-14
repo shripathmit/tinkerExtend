@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from .qa import ask
+from .qa import ask, retrieve
 from .store import KnowledgeBase
 
 
@@ -62,7 +62,8 @@ def _contains_any(text: str, needles: list[str]) -> bool:
     return any(n.lower() in low for n in needles)
 
 
-def eval_retrieval(kb: KnowledgeBase, cases: list[EvalCase], k: int = 5) -> dict:
+def eval_retrieval(kb: KnowledgeBase, cases: list[EvalCase], k: int = 5,
+                   embedder=None) -> dict:
     """hit_rate@k and MRR over the answerable golden cases.
 
     Unanswerable cases are excluded here — retrieving nothing for them is
@@ -72,7 +73,7 @@ def eval_retrieval(kb: KnowledgeBase, cases: list[EvalCase], k: int = 5) -> dict
     for case in cases:
         if not case.answerable:
             continue
-        hits = kb.search(case.question, limit=k)
+        hits = retrieve(case.question, kb, embedder=embedder, limit=k)
         rank = None
         for i, h in enumerate(hits, start=1):
             if _contains_any(h["content"], case.relevant_contains):
@@ -95,11 +96,12 @@ def eval_retrieval(kb: KnowledgeBase, cases: list[EvalCase], k: int = 5) -> dict
     }
 
 
-def eval_answers(kb: KnowledgeBase, cases: list[EvalCase], llm=None, k: int = 5) -> dict:
+def eval_answers(kb: KnowledgeBase, cases: list[EvalCase], llm=None, k: int = 5,
+                 embedder=None) -> dict:
     """Answer quality: expected facts present; unanswerables abstain."""
     per_case = []
     for case in cases:
-        result = ask(case.question, kb, llm=llm, limit=k)
+        result = ask(case.question, kb, llm=llm, limit=k, embedder=embedder)
         answer = result.get("answer", "")
         if not case.answerable:
             abstained = result.get("mode") == "none" or "couldn't find" in answer.lower()
@@ -154,9 +156,32 @@ def parse_health(kb: KnowledgeBase) -> dict:
     return {"kb_stats": stats, "documents": docs}
 
 
-def run_eval(kb: KnowledgeBase, cases: list[EvalCase], llm=None, k: int = 5) -> dict:
+def run_eval(kb: KnowledgeBase, cases: list[EvalCase], llm=None, k: int = 5,
+             embedder=None) -> dict:
     return {
         "parse_health": parse_health(kb),
-        "retrieval": eval_retrieval(kb, cases, k=k),
-        "answers": eval_answers(kb, cases, llm=llm, k=k),
+        "retrieval": eval_retrieval(kb, cases, k=k, embedder=embedder),
+        "answers": eval_answers(kb, cases, llm=llm, k=k, embedder=embedder),
+    }
+
+
+def compare_modes(kb: KnowledgeBase, cases: list[EvalCase], embedder,
+                  k: int = 5) -> dict:
+    """Keyword-only vs hybrid on the same golden set, without per-case detail.
+
+    Hybrid is reported as None when the embedder has no model (disabled).
+    """
+    def summary(emb):
+        ret = eval_retrieval(kb, cases, k=k, embedder=emb)
+        ans = eval_answers(kb, cases, llm=None, k=k, embedder=emb)
+        return {"hit_rate": ret["hit_rate"], "mrr": ret["mrr"],
+                "misses": ret["misses"], "answer_mean": ans["mean_score"],
+                "abstention_rate": ans["abstention_rate"]}
+
+    return {
+        "k": k,
+        "cases": len(cases),
+        "keyword": summary(None),
+        "hybrid": summary(embedder) if embedder is not None and embedder.model else None,
+        "model": getattr(embedder, "model", None),
     }

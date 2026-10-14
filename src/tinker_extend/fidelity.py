@@ -16,11 +16,10 @@ from __future__ import annotations
 import json
 import re
 
-from .chunking import block_page_number
+from .chunking import TAG_STRIP_RE as _TAG_STRIP_RE, block_page_number
 
 _REPLACEMENT = "\ufffd"
 _LONG_TOKEN_RE = re.compile(r"\S{60,}")
-_TAG_STRIP_RE = re.compile(r"<[^>]+>")
 
 
 def _is_garbled(text: str) -> bool:

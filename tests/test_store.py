@@ -45,7 +45,8 @@ def test_ingest_and_search():
     assert kb.search("zebras in antarctica") == []
 
     stats = kb.stats()
-    assert stats == {"documents": 1, "chunks": 2, "token_estimate": 38}
+    assert stats == {"documents": 1, "chunks": 2, "token_estimate": 38,
+                     "embedded_chunks": 0}
     kb.close()
 
 

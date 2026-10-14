@@ -32,4 +32,5 @@ class Chunk:
     blocks_json: str = "[]"   # typed layout blocks (text/table/figure/...) from Extend
     pages_json: str = "[]"    # page numbers this chunk spans
     token_estimate: int = 0
-    embedding_json: str | None = None  # filled when an embedder is configured
+    embedding: bytes | None = None        # normalized float32 vector, when embedded
+    embedding_model: str | None = None    # model that produced `embedding`

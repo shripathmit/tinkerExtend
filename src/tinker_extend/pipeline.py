@@ -10,11 +10,12 @@ from dataclasses import replace
 
 from .chunking import chunks_from_parse_run, num_pages_in_run
 from .classify import classify_content, classify_filename, mark_scan
-from .embeddings import Embedder, NullEmbedder
+from .embeddings import Embedder, NullEmbedder, to_blob
 from .extend_client import ExtendAPIError, ExtendClient, ExtendRunFailed
 from .fidelity import fidelity_metrics, red_flags, text_coverage
 from .ingest import iter_candidate_files, sha256_file
 from .models import Chunk, Document
+from .qa import retrieve
 from .store import KnowledgeBase
 
 # USD per page, Extend pay-as-you-go list prices (verified Oct 2026).
@@ -86,7 +87,8 @@ class KnowledgeBasePipeline:
         stored: list[Chunk] = []
         for chunk, vec in zip(chunks, vectors):
             if vec is not None:
-                chunk = replace(chunk, embedding_json=json.dumps(vec))
+                chunk = replace(chunk, embedding=to_blob(vec),
+                                embedding_model=self.embedder.model)
             stored.append(chunk)
         doc = Document(
             doc_id=doc_id,
@@ -137,7 +139,31 @@ class KnowledgeBasePipeline:
         return summary
 
     def query(self, text: str, limit: int = 10) -> list[dict]:
-        return self.kb.search(text, limit=limit)
+        return retrieve(text, self.kb, embedder=self.embedder, limit=limit)
+
+
+def backfill_embeddings(kb: KnowledgeBase, embedder: Embedder,
+                        batch_size: int = 64) -> int:
+    """Embed chunks with no vector (or one from another model). No API calls.
+
+    Safe to re-run: only missing/stale vectors are computed. Returns the
+    number of chunks embedded.
+    """
+    if not embedder.model:
+        return 0
+    done = 0
+    while True:
+        rows = kb.chunks_needing_embedding(embedder.model, limit=batch_size)
+        if not rows:
+            return done
+        vecs = embedder.embed([r["content"] for r in rows])
+        updates = [(r["chunk_id"], to_blob(v), embedder.model)
+                   for r, v in zip(rows, vecs) if v is not None]
+        kb.set_embeddings(updates)
+        done += len(updates)
+        if len(updates) < len(rows):
+            # Some texts got no vector; they would come back every batch.
+            return done
 
 
 def _source_text_words(path: str) -> str | None:

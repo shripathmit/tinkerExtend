@@ -2,8 +2,16 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .models import Chunk
+
+TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+def strip_markup(text: str) -> str:
+    """Drop HTML tags (serialized tables) and collapse whitespace."""
+    return " ".join(TAG_STRIP_RE.sub(" ", text or "").split())
 
 
 def estimate_tokens(text: str) -> int:

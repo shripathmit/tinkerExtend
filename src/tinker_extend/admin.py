@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .config import load_config
+from .embeddings import embedder_from_env
 from .extend_client import ExtendClient
 from .fidelity import check_golden_doc, fidelity_metrics, load_golden_docs, red_flags
 from .ingest import SUPPORTED_EXTENSIONS, iter_candidate_files, sha256_file
@@ -115,7 +116,8 @@ def _run_wave_job(wave: str, paths: list[str], workers: int) -> None:
         JOBS[wave] = {"status": "running", "progress": {"total": len(paths)},
                       "started_at": time.time()}
     try:
-        ingester = WaveIngester(_client_factory, KB_PATH, workers=workers)
+        ingester = WaveIngester(_client_factory, KB_PATH, workers=workers,
+                                embedder=embedder_from_env())
 
         def on_progress(progress: dict, res: dict) -> None:
             with _JOBS_LOCK:
@@ -147,7 +149,8 @@ def api_overview():
                              "doc_type": r["doc_type"], "flags": fl})
         with _JOBS_LOCK:
             jobs = dict(JOBS)
-        return {"overview": kb.overview(), "waves": waves,
+        vectors = kb.embedding_stats(embedder_from_env().model)
+        return {"overview": kb.overview(), "vectors": vectors, "waves": waves,
                 "recent": recent, "red_flags": flags[:20], "jobs": jobs}
     finally:
         kb.close()
@@ -223,17 +226,13 @@ def api_golden_docs():
 
 @_api.get("/api/admin/golden_qa")
 def api_golden_qa():
-    from .eval import eval_answers, eval_retrieval, load_eval_set
+    from .eval import compare_modes, load_eval_set
     if not os.path.exists(GOLDEN_QA):
         return {"cases": 0, "note": "no golden Q&A yet"}
     kb = _kb()
     try:
         cases = load_eval_set(GOLDEN_QA)
-        ret = eval_retrieval(kb, cases, k=5)
-        ans = eval_answers(kb, cases, llm=None, k=5)
-        ret.pop("per_case", None)
-        ans.pop("per_case", None)
-        return {"cases": len(cases), "retrieval": ret, "answers": ans}
+        return compare_modes(kb, cases, embedder_from_env(), k=5)
     finally:
         kb.close()
 
@@ -527,7 +526,7 @@ ADMIN_PAGE = """<!DOCTYPE html>
   .stage .bar { height: 5px; background: #1c222b; border-radius: 3px; margin-top: 12px; overflow: hidden; }
   .stage .bar i { display: block; height: 100%; background: #2f6fed; border-radius: 3px; }
   /* kpi row */
-  .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 18px; }
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; margin-bottom: 18px; }
   .kpi { background: #10141b; border: 1px solid #1e242e; border-radius: 12px; padding: 14px 16px; }
   .kpi .k { font-size: 11px; color: #697384; margin-bottom: 6px; }
   .kpi .v { font-size: 21px; font-weight: 700; }
@@ -711,7 +710,8 @@ async function loadOverview(){
     <div class="kpi"><div class="k">PARSE SUCCESS</div><div class="v mono ${o.success_rate < 0.95 ? 'bad' : 'good'}">${pct(o.success_rate)}</div></div>
     <div class="kpi"><div class="k">EST. SPEND</div><div class="v mono">${money(o.cost_usd)}</div></div>
     <div class="kpi"><div class="k">DEAD LETTERS</div><div class="v mono ${o.dead_letters ? 'bad' : ''}">${o.dead_letters}</div></div>
-    <div class="kpi"><div class="k">FEEDBACK 👍</div><div class="v mono">${o.feedback_positive}/${o.feedback_total}</div></div>`;
+    <div class="kpi"><div class="k">FEEDBACK 👍</div><div class="v mono">${o.feedback_positive}/${o.feedback_total}</div></div>
+    <div class="kpi" title="${esc(d.vectors.model || 'embeddings disabled')}"><div class="k">VECTORS</div><div class="v mono ${d.vectors.model && d.vectors.embedded < d.vectors.chunks ? 'bad' : ''}">${d.vectors.model ? d.vectors.embedded + '/' + d.vectors.chunks : 'off'}</div></div>`;
   $('dlBadge').textContent = o.dead_letters ? `(${o.dead_letters})` : '';
   $('waves').innerHTML = d.waves.length ? `<table><tr><th>Wave</th><th>Progress</th><th>OK</th><th>Failed</th><th>Cost</th><th>Status</th></tr>` +
     d.waves.map(w => `<tr><td><b>${esc(w.name)}</b></td><td><div style="display:flex;gap:8px;align-items:center">${waveBar(w.ingested, w.target)}</div></td>
@@ -847,12 +847,17 @@ async function loadGolden(){
       ${s.tables.length ? `<div style="font-size:12px;color:#697384;margin-top:8px">Tables: ${s.tables.map(t => esc(t.description) + ' (p.' + t.page + ')').join(' · ')}</div>` : ''}
     </div>`).join('')
     : `<div class="empty">${esc(gd.note || 'No golden docs.')}</div>`;
+  const modeRow = (name, m) => m ? `<tr><td><b>${name}</b></td><td class="num">${m.hit_rate.toFixed(2)}</td>
+    <td class="num">${m.mrr.toFixed(2)}</td><td class="num">${m.answer_mean.toFixed(2)}</td>
+    <td class="num">${pct(m.abstention_rate || 0)}</td></tr>`
+    : `<tr><td><b>${name}</b></td><td colspan="4" style="color:#697384">embeddings disabled</td></tr>`;
+  const misses = ['keyword', 'hybrid'].filter(k => gq[k] && gq[k].misses.length)
+    .map(k => `${k}: ${gq[k].misses.map(esc).join(' · ')}`);
   $('gqa').innerHTML = gq.cases ? `
-    <table><tr><th>Cases</th><th>Hit rate@5</th><th>MRR</th><th>Answer mean</th><th>Abstention</th></tr>
-    <tr><td class="num">${gq.cases}</td><td class="num">${gq.retrieval.hit_rate.toFixed(2)}</td>
-    <td class="num">${gq.retrieval.mrr.toFixed(2)}</td><td class="num">${gq.answers.mean_score.toFixed(2)}</td>
-    <td class="num">${pct(gq.answers.abstention_rate || 0)}</td></tr></table>
-    ${gq.retrieval.misses.length ? `<div style="margin-top:10px;font-size:13px;color:#f0b46a">Retrieval misses: ${gq.retrieval.misses.map(esc).join(' · ')}</div>` : ''}`
+    <div style="font-size:12px;color:#697384;margin-bottom:8px">${gq.cases} cases · k=${gq.k} · model ${esc(gq.model || 'none')}</div>
+    <table><tr><th>Search</th><th>Hit rate@5</th><th>MRR</th><th>Answer mean</th><th>Abstention</th></tr>
+    ${modeRow('Keyword', gq.keyword)}${modeRow('Hybrid', gq.hybrid)}</table>
+    ${misses.length ? `<div style="margin-top:10px;font-size:13px;color:#f0b46a">Retrieval misses — ${misses.join(' | ')}</div>` : ''}`
     : `<div class="empty">${esc(gq.note || 'No golden Q&A.')}</div>`;
 }
 

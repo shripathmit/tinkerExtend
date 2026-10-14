@@ -24,14 +24,15 @@ from . import __version__
 from .admin import router as admin_router
 from .classify import classify_content
 from .config import load_config
+from .embeddings import embedder_from_env
 from .extend_client import ExtendClient
 from .fidelity import fidelity_metrics
 from .htmlfmt import to_safe_html
 from .ingest import iter_candidate_files
 from .llm import llm_from_env
 from .pages import page_boxes, render_pages, resolve_pdf
-from .pipeline import KnowledgeBasePipeline
-from .qa import ask
+from .pipeline import KnowledgeBasePipeline, backfill_embeddings
+from .qa import ask, retrieve
 from .store import KnowledgeBase
 
 SEED_DIR = os.environ.get("TINKER_SEED_DIR", "./seed_docs")
@@ -61,7 +62,7 @@ def seed_if_empty() -> str:
             return f"seed skipped: {exc}"
         client = ExtendClient(api_key=cfg.api_key, api_version=cfg.api_version,
                               base_url=cfg.base_url, workspace_id=cfg.workspace_id)
-        pipe = KnowledgeBasePipeline(client, kb)
+        pipe = KnowledgeBasePipeline(client, kb, embedder=embedder_from_env())
         summary = pipe.ingest_paths(files)
         return f"seeded: {summary}"
     finally:
@@ -164,11 +165,29 @@ def backfill_telemetry() -> str:
         kb.close()
 
 
+def backfill_vectors() -> str:
+    """Embed chunks stored before embeddings existed (or under another model)."""
+    embedder = embedder_from_env()
+    if not embedder.model:
+        return "embeddings disabled; search is keyword-only"
+    kb = get_kb()
+    try:
+        n = backfill_embeddings(kb, embedder)
+        st = kb.embedding_stats(embedder.model)
+        return (f"embedded {n} chunk(s); {st['embedded']}/{st['chunks']} have"
+                f" {embedder.model} vectors")
+    finally:
+        kb.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load the embedding model first so seeding stores vectors directly.
+    embedder_from_env()
     print("tinkerExtend boot:", seed_if_empty(), flush=True)
     print("tinkerExtend boot:", ensure_page_images(), flush=True)
     print("tinkerExtend boot:", backfill_telemetry(), flush=True)
+    print("tinkerExtend boot:", backfill_vectors(), flush=True)
     yield
 
 
@@ -183,7 +202,7 @@ app.include_router(admin_router)
 def api_stats():
     kb = get_kb()
     try:
-        return kb.stats()
+        return {**kb.stats(), "embed_model": embedder_from_env().model}
     finally:
         kb.close()
 
@@ -192,10 +211,11 @@ def api_stats():
 def api_search(q: str, limit: int = 10):
     kb = get_kb()
     try:
-        hits = kb.search(q, limit=limit)
+        hits = retrieve(q, kb, embedder=embedder_from_env(), limit=limit)
         passages = [
             {"n": i + 1, "chunk_id": h["chunk_id"], "doc_source": h["doc_source"],
-             "pages": h["pages_json"], "content": h["content"]}
+             "pages": h["pages_json"], "content": h["content"],
+             "match": h.get("match", "keyword"), "vector_score": h.get("vector_score")}
             for i, h in enumerate(hits)
         ]
         return {"query": q,
@@ -212,7 +232,8 @@ def api_ask(payload: dict):
         return JSONResponse({"error": "question is required"}, status_code=400)
     kb = get_kb()
     try:
-        result = ask(question, kb, llm=llm_from_env(), limit=limit)
+        result = ask(question, kb, llm=llm_from_env(), limit=limit,
+                     embedder=embedder_from_env())
         passages = [enrich_passage(kb, p) for p in result.get("passages", [])]
         if result["mode"] == "extractive":
             answer_html = to_safe_html(result["answer"])
@@ -392,7 +413,8 @@ let viewState = null; // {passageIdx, pageIdx}
 
 fetch('/api/stats').then(r => r.json()).then(s => {
   document.getElementById('stats').textContent =
-    s.documents + ' documents · ' + s.chunks + ' chunks · ~' + s.token_estimate + ' tokens';
+    s.documents + ' documents · ' + s.chunks + ' chunks · ~' + s.token_estimate + ' tokens' +
+    (s.embed_model ? ' · hybrid search (' + s.embedded_chunks + ' embedded)' : ' · keyword search');
 });
 
 function esc(t){ const d=document.createElement('div'); d.textContent=t; return d.innerHTML; }

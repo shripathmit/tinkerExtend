@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS chunks (
   embedding_json TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id, content);
+CREATE TABLE IF NOT EXISTS feedback (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at   TEXT NOT NULL,
+  question     TEXT NOT NULL,
+  answer_mode  TEXT NOT NULL DEFAULT '',
+  answer       TEXT NOT NULL DEFAULT '',
+  chunk_ids    TEXT NOT NULL DEFAULT '[]',
+  rating       INTEGER NOT NULL,          -- +1 helpful, -1 not helpful
+  comment      TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -191,6 +201,27 @@ class KnowledgeBase:
             "SELECT COALESCE(SUM(token_estimate), 0) FROM chunks"
         ).fetchone()[0]
         return {"documents": docs, "chunks": chunks, "token_estimate": tokens}
+
+    def add_feedback(self, question: str, answer_mode: str, answer: str,
+                     chunk_ids: list, rating: int, comment: str = "") -> int:
+        """Record a thumbs up/down on an answer. Returns the feedback id."""
+        import datetime
+        cur = self.conn.execute(
+            "INSERT INTO feedback (created_at, question, answer_mode, answer,"
+            " chunk_ids, rating, comment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             question, answer_mode, answer[:4000],
+             json.dumps(chunk_ids or []), 1 if rating > 0 else -1,
+             comment[:2000]),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_feedback(self, limit: int = 200) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_document(self, doc_id: str) -> dict | None:
         row = self.conn.execute(

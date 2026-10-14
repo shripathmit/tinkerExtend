@@ -1,6 +1,8 @@
 # Runtime: stdlib only for the pipeline; FastAPI for the web UI.
 fastapi>=0.110
 uvicorn>=0.29
+# Page rendering for the source viewer (trust UI).
+pymupdf>=1.24
 
 # The official Extend SDK is optional — tinker_extend talks to the REST API directly.
 # Uncomment for ad-hoc exploration:

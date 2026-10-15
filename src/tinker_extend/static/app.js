@@ -1209,7 +1209,7 @@ function renderDataProviders() {
       <span class="flex-1 min-w-0">
         <span class="flex items-center gap-2 flex-wrap">
           <span class="text-xs font-mono font-medium text-ink">${esc(p.name)}</span>
-          <span class="font-mono text-[10px] px-1.5 py-px rounded-sm ${p.configured ? 'bg-emeraldOk/15 text-emeraldOk' : 'bg-amberWarn/15 text-amberWarn'}">${p.configured ? 'READY' : 'NO KEY'}</span>
+          <span class="font-mono text-[10px] px-1.5 py-px ${p.configured ? 'bg-emeraldOk/15 text-emeraldOk' : 'bg-amberWarn/15 text-amberWarn'}">${p.configured ? 'READY' : 'NO KEY'}</span>
         </span>
         <span class="block text-[11px] text-inkFaint mt-1">${p.configured ? '' : esc(p.reason)}</span>
         ${p.configured && models.length ? `<select data-model-for="${esc(p.name)}"
@@ -1279,7 +1279,8 @@ function pollDataRun(id) {
       }
       clearInterval(state.dataPoll); state.dataPoll = null;
       $('data-run-btn').disabled = false;
-      status.textContent = run.status === 'done' ? `Run #${id} complete.` : `Run #${id} failed.`;
+      status.textContent = run.status === 'done' ? `Run #${id} complete.`
+        : `Run #${id} failed: ${(run.result && run.result.error) || 'unknown error'}`;
       renderDataResults(run);
       loadDataRunsOnly();
     } catch (e) {
@@ -1300,7 +1301,7 @@ function renderDataRuns() {
         <span class="block text-xs font-mono text-ink truncate">#${r.id} · ${esc(r.filename)}</span>
         <span class="block text-[11px] font-mono text-inkFaint mt-1">${esc(r.created_at || '')} · ${(r.providers || []).join(', ')}</span>
       </span>
-      <span class="font-mono text-[10px] px-1.5 py-px rounded-sm shrink-0 ${r.status === 'done' ? 'bg-emeraldOk/15 text-emeraldOk' : r.status === 'error' ? 'bg-amberWarn/15 text-amberWarn' : 'bg-hairlineSubtle text-inkMuted'}">${esc(r.status).toUpperCase()}</span>
+      <span class="font-mono text-[10px] px-1.5 py-px shrink-0 ${r.status === 'done' ? 'bg-emeraldOk/15 text-emeraldOk' : r.status === 'error' ? 'bg-amberWarn/15 text-amberWarn' : 'bg-hairlineSubtle text-inkMuted'}">${esc(r.status).toUpperCase()}</span>
     </button>`).join('')
     : '<p class="text-xs text-inkFaint py-4">No runs yet.</p>';
 }
@@ -1311,7 +1312,9 @@ async function onDataRunClick(ev) {
   try {
     const run = await api(`/api/admin/provider_runs/${btn.dataset.run}`);
     if (run.status === 'done') renderDataResults(run);
-    else $('data-run-status').textContent = `Run #${run.id} is ${run.status}.`;
+    else $('data-run-status').textContent = run.status === 'error'
+      ? `Run #${run.id} failed: ${(run.result && run.result.error) || 'unknown error'}`
+      : `Run #${run.id} is ${run.status}.`;
   } catch (e) { $('data-run-status').textContent = e.message; }
 }
 
@@ -1327,7 +1330,7 @@ function renderDataResults(run) {
   const sec = $('data-results');
   if (!names.length) { sec.classList.add('hidden'); return; }
   sec.classList.remove('hidden');
-  $('data-winners-sub').textContent = `${esc(run.filename || '')} · ran ${esc(res.ran_at || '')}`;
+  $('data-winners-sub').textContent = `${run.filename || ''} · ran ${res.ran_at || ''}`;
   const winners = res.winners || {};
   $('data-winners').innerHTML = Object.keys(WINNER_LABELS).map((k) => `
     <div class="bg-canvas px-4 py-5">
@@ -1352,7 +1355,7 @@ function renderDataResults(run) {
   $('data-provider-cards').innerHTML = names.map((n) => {
     const p = providers[n];
     const f = p.fidelity;
-    const flagCount = (p.checks || []).filter((c) => !c.ok).length;
+    const flagCount = (p.checks || []).filter((c) => c.ok === false).length;  // ok null = not applicable
     const sample = (p.blocks || []).slice(0, 3).map((b) =>
       `<div class="border-l-2 border-hairline pl-3 py-1">
          <div class="font-mono text-[10px] text-inkFaint mb-1">${esc(b.type)} · page ${b.metadata && b.metadata.page ? b.metadata.page.number : '?'}</div>
@@ -1363,7 +1366,7 @@ function renderDataResults(run) {
       <div class="px-5 py-4 border-b border-hairlineSubtle flex flex-wrap items-center justify-between gap-3">
         <div class="flex items-center gap-3">
           <span class="font-mono text-sm font-medium text-ink">${esc(n)}</span>
-          <span class="font-mono text-[10px] px-1.5 py-px rounded-sm ${p.ok ? 'bg-emeraldOk/15 text-emeraldOk' : 'bg-amberWarn/15 text-amberWarn'}">${p.ok ? 'OK' : 'ERROR'}</span>
+          <span class="font-mono text-[10px] px-1.5 py-px ${p.ok ? 'bg-emeraldOk/15 text-emeraldOk' : 'bg-amberWarn/15 text-amberWarn'}">${p.ok ? 'OK' : 'ERROR'}</span>
           ${p.ok ? `<span class="text-[11px] font-mono text-inkFaint">${money(p.cost_usd)} · ${p.duration_s}s · ${(p.input_tokens || 0).toLocaleString()}/${(p.output_tokens || 0).toLocaleString()} tokens</span>` : ''}
         </div>
         <span class="text-[11px] font-mono text-inkFaint">${esc(p.model || '')}</span>
@@ -1372,8 +1375,8 @@ function renderDataResults(run) {
         <p class="text-xs text-ink leading-relaxed">${esc(p.verdict || p.error || '')}</p>
         ${(p.checks || []).length ? `<div class="grid sm:grid-cols-2 gap-x-8 gap-y-2">` + p.checks.map((c) => `
           <div class="flex items-start gap-2 text-[11px] font-mono">
-            <span class="${c.ok ? 'text-emeraldOk' : 'text-amberWarn'} shrink-0">${c.ok ? '✓' : '✕'}</span>
-            <span class="text-inkMuted">${esc(c.label)}: <span class="text-ink">${esc(String(c.value))}</span>${c.threshold ? ` <span class="text-inkFaint">(≥ ${esc(String(c.threshold))})</span>` : ''}</span>
+            <span class="${c.ok === true ? 'text-emeraldOk' : c.ok === false ? 'text-amberWarn' : 'text-inkFaint'} shrink-0">${c.ok === true ? '✓' : c.ok === false ? '✕' : '–'}</span>
+            <span class="text-inkMuted">${esc(c.label)}: <span class="text-ink">${esc(String(c.value))}</span>${c.ok !== null && c.threshold ? ` <span class="text-inkFaint">(target ${esc(String(c.threshold))})</span>` : ''}</span>
           </div>`).join('') + `</div>` : ''}
         ${f ? `<div class="text-[11px] font-mono text-inkFaint">${f.num_blocks} blocks · ${flagCount} flag${flagCount === 1 ? '' : 's'}</div>` : ''}
         ${sample ? `<div class="space-y-3"><div class="text-[11px] font-mono uppercase tracking-wider text-inkFaint">Sample blocks</div>${sample}</div>` : ''}

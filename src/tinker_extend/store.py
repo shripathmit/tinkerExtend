@@ -497,6 +497,15 @@ class KnowledgeBase:
         self.conn.commit()
         return cur.lastrowid
 
+    def fail_interrupted_provider_runs(self) -> int:
+        """Runs left 'running' by a restart can never finish; mark them failed."""
+        cur = self.conn.execute(
+            "UPDATE provider_runs SET status = 'error', result_json = ?"
+            " WHERE status = 'running'",
+            (json.dumps({"error": "Interrupted by a server restart. Start the run again."}),))
+        self.conn.commit()
+        return cur.rowcount
+
     def finish_provider_run(self, run_id: int, result: dict,
                             status: str = "done") -> None:
         self.conn.execute(

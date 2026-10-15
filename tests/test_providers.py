@@ -180,3 +180,146 @@ def test_provider_run_store(tmp_path):
         assert kb.get_provider_run(9999) is None
     finally:
         kb.close()
+
+
+# --- v0.9.3 fixes ---------------------------------------------------------
+
+class _FakeHTTP:
+    """Captures the request body and returns a canned JSON response."""
+
+    def __init__(self, response: dict):
+        self.response = response
+        self.body = None
+
+    def __call__(self, req, timeout=None):
+        self.body = json.loads(req.data.decode())
+        payload = json.dumps(self.response).encode()
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return payload
+        return _Resp()
+
+
+def _pdf(tmp_path):
+    p = tmp_path / "doc.pdf"
+    p.write_bytes(b"%PDF-1.4 fake")
+    return str(p)
+
+
+@pytest.mark.parametrize("cls, env, value", [
+    (providers.OpenAIProvider, "TINKER_OPENAI_PARSE_MODEL", "gpt-5-mini"),
+    (providers.GeminiProvider, "TINKER_GEMINI_PARSE_MODEL", "gemini-2.5-pro"),
+    (providers.ExtendProvider, "TINKER_PLAYGROUND_EXTEND_ENGINE", "parse_light"),
+])
+def test_model_env_settings_are_honored(monkeypatch, cls, env, value):
+    monkeypatch.delenv(env, raising=False)
+    assert cls().model == cls.default_model
+    monkeypatch.setenv(env, value)
+    assert cls().model == value                    # env beats the class default
+    assert cls(model=cls.default_model).model == cls.default_model  # dropdown beats env
+    st = {p["name"]: p for p in provider_status()}
+    assert st[cls.name]["default_model"] == value
+
+
+@pytest.mark.parametrize("model, cap", [
+    ("gpt-4o", 16_384), ("gpt-4o-mini", 16_384), ("gpt-5", 128_000), ("unknown-model", 16_384),
+])
+def test_openai_requests_stay_within_model_output_limit(monkeypatch, tmp_path, model, cap):
+    monkeypatch.setenv("TINKER_OPENAI_API_KEY", "k")
+    fake = _FakeHTTP({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(
+        {"blocks": [{"page": 1, "type": "text", "content": "hello"}]})}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    res = providers.OpenAIProvider(model=model).parse(_pdf(tmp_path))
+    assert fake.body["max_completion_tokens"] == cap
+    assert res.pages == 1 and res.blocks[0]["content"] == "hello"
+
+
+@pytest.mark.parametrize("model, cap", [
+    ("gemini-2.0-flash", 8_192), ("gemini-2.5-flash", 65_536), ("unknown-model", 8_192),
+])
+def test_gemini_requests_stay_within_model_output_limit(monkeypatch, tmp_path, model, cap):
+    monkeypatch.setenv("TINKER_GEMINI_API_KEY", "k")
+    fake = _FakeHTTP({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps(
+        {"blocks": [{"page": 1, "type": "text", "content": "hello"}]})}]}}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}})
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    providers.GeminiProvider(model=model).parse(_pdf(tmp_path))
+    assert fake.body["generationConfig"]["maxOutputTokens"] == cap
+
+
+def test_truncated_llm_output_is_reported_clearly(monkeypatch, tmp_path):
+    monkeypatch.setenv("TINKER_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("TINKER_GEMINI_API_KEY", "k")
+    monkeypatch.setattr(providers.urllib.request, "urlopen", _FakeHTTP(
+        {"choices": [{"finish_reason": "length", "message": {"content": '{"blocks": [{"page": 1,'}}]}))
+    with pytest.raises(RuntimeError, match=r"Output truncated: gpt-4o stopped at its 16,384-token"):
+        providers.OpenAIProvider().parse(_pdf(tmp_path))
+    monkeypatch.setattr(providers.urllib.request, "urlopen", _FakeHTTP(
+        {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": '{"blocks": ['}]}}]}))
+    with pytest.raises(RuntimeError, match=r"Output truncated: gemini-2.0-flash stopped at its 8,192-token"):
+        providers.GeminiProvider().parse(_pdf(tmp_path))
+
+
+def test_fewest_flags_ignores_checks_that_do_not_apply():
+    base = {"ok": True, "fidelity": {"text_coverage": 0.9, "table_shape_rate": 1.0},
+            "cost_usd": 0.05, "duration_s": 5.0}
+    # "a" has two not-applicable checks (ok None) and no failures;
+    # "b" has one real failure. "a" is cleaner.
+    a = {**base, "checks": [{"ok": True}, {"ok": None}, {"ok": None}]}
+    b = {**base, "checks": [{"ok": True}, {"ok": False}, {"ok": True}]}
+    assert pick_winners({"a": a, "b": b})["fewest_flags"] == "a"
+
+
+def test_extend_provider_uses_production_client_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("EXTEND_API_KEY", "ek")
+    monkeypatch.setenv("EXTEND_WORKSPACE_ID", "ws_1")
+    monkeypatch.setenv("EXTEND_API_VERSION", "2099-01-01")
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        def upload_file(self, path):
+            return "file_1"
+
+        def parse_async(self, file, engine=None, metadata=None, **kw):
+            seen["engine"] = engine
+            return {"id": "run_1", "output": {"chunks": [{"blocks": [
+                {"type": "text", "content": "x", "metadata": {"page": {"number": 1}}}]}]}}
+
+    import tinker_extend.extend_client as ec
+    monkeypatch.setattr(ec, "ExtendClient", FakeClient)
+    res = providers.ExtendProvider(model="parse_light").parse(_pdf(tmp_path))
+    assert seen["workspace_id"] == "ws_1" and seen["api_version"] == "2099-01-01"
+    assert seen["engine"] == "parse_light"
+    assert res.cost_usd == pytest.approx(0.00625)
+
+
+def test_interrupted_provider_runs_are_failed_on_startup(tmp_path):
+    from tinker_extend.store import KnowledgeBase
+    kb = KnowledgeBase(str(tmp_path / "kb.sqlite3"))
+    running = kb.create_provider_run("a.pdf", "/x/a.pdf", ["openai"])
+    done = kb.create_provider_run("b.pdf", "/x/b.pdf", ["openai"])
+    kb.finish_provider_run(done, {"providers": {}}, status="done")
+    assert kb.fail_interrupted_provider_runs() == 1
+    row = kb.get_provider_run(running)
+    assert row["status"] == "error" and "restart" in row["result"]["error"]
+    assert kb.get_provider_run(done)["status"] == "done"
+    kb.close()
+
+
+def test_best_tables_requires_tables():
+    base = {"ok": True, "cost_usd": 0.05, "duration_s": 5.0, "checks": []}
+    no_tables = {**base, "fidelity": {"text_coverage": 0.9, "table_shape_rate": 1.0, "table_blocks": 0}}
+    some = {**base, "fidelity": {"text_coverage": 0.9, "table_shape_rate": 0.6, "table_blocks": 5}}
+    assert pick_winners({"a": no_tables, "b": some})["table_shape"] == "b"
+    assert pick_winners({"a": no_tables})["table_shape"] is None

@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -76,6 +77,12 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+def truncation_message(model: str, limit: int) -> str:
+    """Error shown when an LLM stops at its output limit mid-document."""
+    return (f"Output truncated: {model} stopped at its {limit:,}-token output limit before "
+            "finishing the document. Try a shorter PDF or a model with a larger output limit.")
+
+
 def _usd(in_tokens: int, out_tokens: int, rate_in: float, rate_out: float) -> float:
     return in_tokens / 1_000_000 * rate_in + out_tokens / 1_000_000 * rate_out
 
@@ -122,9 +129,15 @@ class ParseProvider:
 
     name = "base"
     default_model = ""
+    model_env = ""  # env var that overrides default_model, e.g. TINKER_OPENAI_PARSE_MODEL
 
     def __init__(self, model: str | None = None) -> None:
-        self._model = model or self.default_model
+        # Explicit choice (Data tab dropdown) > env setting > class default.
+        self._model = model or self.env_default()
+
+    @classmethod
+    def env_default(cls) -> str:
+        return (os.environ.get(cls.model_env, "") if cls.model_env else "") or cls.default_model
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -149,11 +162,11 @@ class ExtendProvider(ParseProvider):
 
     name = "extend"
     default_model = "parse_performance"
+    model_env = "TINKER_PLAYGROUND_EXTEND_ENGINE"
 
     def __init__(self, model: str | None = None) -> None:
         super().__init__(model)
-        self.engine = self._model or os.environ.get(
-            "TINKER_PLAYGROUND_EXTEND_ENGINE", "parse_performance")
+        self.engine = self._model
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -169,13 +182,15 @@ class ExtendProvider(ParseProvider):
         return self.engine
 
     def parse(self, path: str) -> ProviderResult:
+        from .config import load_config
         from .extend_client import ExtendClient
         from .pipeline import ENGINE_RATES
 
-        api_key = os.environ.get("EXTEND_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("EXTEND_API_KEY not set")
-        client = ExtendClient(api_key=api_key)
+        cfg = load_config()  # raises with a clear message if EXTEND_API_KEY is unset
+        # Same client settings as production ingestion (API version,
+        # workspace, base URL), so workspace-scoped keys work here too.
+        client = ExtendClient(api_key=cfg.api_key, api_version=cfg.api_version,
+                              base_url=cfg.base_url, workspace_id=cfg.workspace_id)
         file_id = client.upload_file(path)
         run = client.parse_async(
             {"id": file_id}, engine=self.engine,
@@ -199,14 +214,20 @@ class OpenAIProvider(ParseProvider):
     RATES = {"gpt-4o": (2.50, 10.00), "gpt-4o-mini": (0.15, 0.60),
              "gpt-5": (1.25, 10.00), "gpt-5-mini": (0.25, 2.00)}
 
+    # Maximum output tokens per model; requests above the limit are rejected.
+    MAX_OUTPUT = {"gpt-4o": 16_384, "gpt-4o-mini": 16_384,
+                  "gpt-5": 128_000, "gpt-5-mini": 128_000}
+    DEFAULT_MAX_OUTPUT = 16_384
+
     default_model = "gpt-4o"
+    model_env = "TINKER_OPENAI_PARSE_MODEL"
 
     def __init__(self, model: str | None = None) -> None:
         super().__init__(model)
         self.api_key = os.environ.get("TINKER_OPENAI_API_KEY", "")
-        if not self._model:
-            self._model = os.environ.get("TINKER_OPENAI_PARSE_MODEL",
-                                         self.default_model)
+
+    def max_output_tokens(self) -> int:
+        return self.MAX_OUTPUT.get(self._model, self.DEFAULT_MAX_OUTPUT)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -234,7 +255,7 @@ class OpenAIProvider(ParseProvider):
                 ],
             }],
             "response_format": {"type": "json_object"},
-            "max_completion_tokens": 32000,
+            "max_completion_tokens": self.max_output_tokens(),
         }
         req = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
@@ -252,10 +273,13 @@ class OpenAIProvider(ParseProvider):
                 err = {}
             raise RuntimeError(
                 f"OpenAI HTTP {exc.code}: {err.get('error', {}).get('message', exc.reason)}") from exc
+        choice = (data.get("choices") or [{}])[0]
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError(truncation_message(self._model, self.max_output_tokens()))
         try:
-            content = data["choices"][0]["message"]["content"]
+            content = choice["message"]["content"]
             payload = json.loads(_strip_fences(content))
-        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenAI returned unparseable output: {exc}") from exc
         usage = data.get("usage") or {}
         in_tok = int(usage.get("prompt_tokens") or 0)
@@ -282,15 +306,21 @@ class GeminiProvider(ParseProvider):
     RATES = {"gemini-2.0-flash": (0.10, 0.40), "gemini-2.5-flash": (0.30, 2.50),
              "gemini-2.5-pro": (1.25, 10.00)}
 
+    # Maximum output tokens per model; requests above the limit fail.
+    MAX_OUTPUT = {"gemini-2.0-flash": 8_192, "gemini-2.5-flash": 65_536,
+                  "gemini-2.5-pro": 65_536}
+    DEFAULT_MAX_OUTPUT = 8_192
+
     default_model = "gemini-2.0-flash"
+    model_env = "TINKER_GEMINI_PARSE_MODEL"
 
     def __init__(self, model: str | None = None) -> None:
         super().__init__(model)
         self.api_key = (os.environ.get("TINKER_GEMINI_API_KEY", "")
                         or os.environ.get("GOOGLE_API_KEY", ""))
-        if not self._model:
-            self._model = os.environ.get("TINKER_GEMINI_PARSE_MODEL",
-                                         self.default_model)
+
+    def max_output_tokens(self) -> int:
+        return self.MAX_OUTPUT.get(self._model, self.DEFAULT_MAX_OUTPUT)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -312,7 +342,7 @@ class GeminiProvider(ParseProvider):
                 {"inlineData": {"mimeType": "application/pdf", "data": b64}},
             ]}],
             "generationConfig": {"responseMimeType": "application/json",
-                                 "maxOutputTokens": 65536},
+                                 "maxOutputTokens": self.max_output_tokens()},
         }
         req = urllib.request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent",
@@ -329,10 +359,13 @@ class GeminiProvider(ParseProvider):
                 err = {}
             msg = (err.get("error") or {}).get("message", f"HTTP {exc.code}")
             raise RuntimeError(f"Gemini {msg}") from exc
+        cand = (data.get("candidates") or [{}])[0]
+        if cand.get("finishReason") == "MAX_TOKENS":
+            raise RuntimeError(truncation_message(self._model, self.max_output_tokens()))
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = cand["content"]["parts"][0]["text"]
             payload = json.loads(_strip_fences(text))
-        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Gemini returned unparseable output: {exc}") from exc
         usage = data.get("usageMetadata") or {}
         in_tok = int(usage.get("promptTokenCount") or 0)
@@ -413,12 +446,18 @@ def pick_winners(scored: dict) -> dict:
     if not ok:
         return {}
     cov = lambda n: ok[n]["fidelity"].get("text_coverage")
+    # table_shape_rate is 1.0 when a provider found no tables at all, so only
+    # providers that actually extracted tables can win "best tables".
+    with_tables = [n for n in ok if (ok[n]["fidelity"].get("table_blocks") or 0) > 0]
     return {
         "coverage": max(ok, key=lambda n: cov(n) if cov(n) is not None else -1),
-        "table_shape": max(ok, key=lambda n: ok[n]["fidelity"].get("table_shape_rate") or -1),
+        "table_shape": (max(with_tables, key=lambda n: ok[n]["fidelity"].get("table_shape_rate") or 0)
+                        if with_tables else None),
         "cheapest": min(ok, key=lambda n: ok[n]["cost_usd"]),
         "fastest": min(ok, key=lambda n: ok[n]["duration_s"]),
-        "fewest_flags": min(ok, key=lambda n: sum(1 for c in ok[n]["checks"] if not c.get("ok"))),
+        # ok is None for checks that don't apply (no tables, not a scan);
+        # only ok is False is a flag.
+        "fewest_flags": min(ok, key=lambda n: sum(1 for c in ok[n]["checks"] if c.get("ok") is False)),
     }
 
 

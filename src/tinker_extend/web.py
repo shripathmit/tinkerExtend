@@ -207,6 +207,13 @@ async def lifespan(app: FastAPI):
     print("tinkerExtend boot:", backfill_telemetry(), flush=True)
     print("tinkerExtend boot:", recompute_fidelity_if_changed(), flush=True)
     print("tinkerExtend boot:", backfill_vectors(), flush=True)
+    kb = get_kb()
+    try:
+        n = kb.fail_interrupted_provider_runs()
+    finally:
+        kb.close()
+    if n:
+        print(f"tinkerExtend boot: marked {n} interrupted Data-tab run(s) as failed", flush=True)
     yield
 
 

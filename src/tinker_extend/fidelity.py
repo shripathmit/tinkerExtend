@@ -17,6 +17,7 @@ import json
 import re
 import unicodedata
 from collections import Counter
+from decimal import ROUND_HALF_UP, Decimal
 
 from .chunking import TAG_STRIP_RE as _TAG_STRIP_RE, block_page_number
 
@@ -294,10 +295,15 @@ def red_flags(m: dict) -> list[str]:
     return [_FLAG_TEXT[c["key"]](full) for c in fidelity_checks(full) if c["ok"] is False]
 
 
+def usd(amount: float) -> str:
+    """Dollars rounded half-up, matching the UI (JS toFixed): $0.625 -> "$0.63"."""
+    return "$" + str(Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def fidelity_verdict(m: dict, pages: int, rate: float) -> str:
     """One plain sentence: what matters most and whether to re-parse."""
     failing = {c["key"] for c in fidelity_checks(m) if c["ok"] is False}
-    cost = f"${pages * rate:.2f}"
+    cost = usd(pages * rate)
     if not failing:
         return "Clean parse. No re-parse needed."
     if failing & {"table_shape", "ocr", "garbled"}:

@@ -77,7 +77,7 @@ def test_flag_wording_and_plurals():
 def test_verdict_names_the_main_issue_and_cost():
     v = fidelity_verdict(_metrics(), pages=25, rate=0.025)
     assert v.startswith("Tables are the main issue")
-    assert "$0.62" in v  # 25 pages x $0.025
+    assert "$0.63" in v  # 25 pages x $0.025 = $0.625, rounded half-up like the UI
     assert "optional" in fidelity_verdict(
         _metrics(table_shape_ok=9, repeated_ngrams=0), pages=25, rate=0.025)
     assert fidelity_verdict(_metrics(table_shape_ok=9, repeated_ngrams=0, text_coverage=0.99),

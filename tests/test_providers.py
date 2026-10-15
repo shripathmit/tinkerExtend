@@ -208,9 +208,9 @@ class _FakeHTTP:
 
 
 def _pdf(tmp_path):
-    p = tmp_path / "doc.pdf"
-    p.write_bytes(b"%PDF-1.4 fake")
-    return str(p)
+    # a real single-page PDF: parse() now counts pages via pypdf before
+    # any HTTP call, so fake bytes no longer work here
+    return _multipage_pdf(tmp_path, 1)
 
 
 @pytest.mark.parametrize("cls, env, value", [
@@ -323,3 +323,152 @@ def test_best_tables_requires_tables():
     some = {**base, "fidelity": {"text_coverage": 0.9, "table_shape_rate": 0.6, "table_blocks": 5}}
     assert pick_winners({"a": no_tables, "b": some})["table_shape"] == "b"
     assert pick_winners({"a": no_tables})["table_shape"] is None
+
+
+def _multipage_pdf(tmp_path, n_pages):
+    from pypdf import PdfWriter
+    p = tmp_path / f"doc{n_pages}.pdf"
+    w = PdfWriter()
+    for _ in range(n_pages):
+        w.add_blank_page(width=72, height=72)
+    with open(p, "wb") as f:
+        w.write(f)
+    return str(p)
+
+
+def test_extraction_prompt_names_page_range():
+    assert "page by page" in providers.extraction_prompt()
+    scoped = providers.extraction_prompt(11, 20)
+    assert "pages 11 through 20" in scoped
+    assert "ORIGINAL page numbers (11-20)" in scoped
+    assert "never renumber from 1" in scoped
+
+
+def test_chunk_ranges_single_for_small_pdf(tmp_path):
+    path = _multipage_pdf(tmp_path, 5)
+    assert providers._chunk_ranges(path, 10 * 1024 * 1024, 8) == [(0, 5)]
+
+
+def test_chunk_ranges_split_by_pages_and_bytes(tmp_path):
+    path = _multipage_pdf(tmp_path, 25)
+    assert providers._chunk_ranges(path, 10 * 1024 * 1024, 10) == [
+        (0, 10), (10, 20), (20, 25)]
+    per_page = os.path.getsize(path) / 25
+    ranges = providers._chunk_ranges(path, int(per_page * 2.5), 10)
+    assert ranges[0] == (0, 2)
+    assert ranges[-1][1] == 25
+    assert sum(e - s for s, e in ranges) == 25
+
+
+def test_globalize_block_pages_shifts_local_numbering():
+    blocks = normalize_llm_blocks({"blocks": [
+        {"page": 1, "type": "text", "content": "a"},
+        {"page": 2, "type": "text", "content": "b"},
+    ]})
+    providers._globalize_block_pages(blocks, 11, 20)
+    assert [b["metadata"]["page"]["number"] for b in blocks] == [11, 12]
+
+
+def test_globalize_block_pages_keeps_global_numbering():
+    blocks = normalize_llm_blocks({"blocks": [
+        {"page": 11, "type": "text", "content": "a"},
+        {"page": 12, "type": "text", "content": "b"},
+    ]})
+    providers._globalize_block_pages(blocks, 11, 20)
+    assert [b["metadata"]["page"]["number"] for b in blocks] == [11, 12]
+
+
+class _SequencedFakeHTTP:
+    """Returns a different canned response per call; records request bodies."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.bodies = []
+        self.calls = 0
+
+    def __call__(self, req, timeout=None):
+        self.bodies.append(json.loads(req.data.decode()))
+        resp = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        payload = json.dumps(resp).encode()
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return payload
+        return _Resp()
+
+
+def _openai_ok(pages, in_tok=100, out_tok=50):
+    blocks = [{"page": p, "type": "text", "content": f"page {p} text"}
+              for p in pages]
+    return {"choices": [{"finish_reason": "stop",
+                         "message": {"content": json.dumps({"blocks": blocks})}}],
+            "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok}}
+
+
+def test_openai_splits_large_pdf_and_merges_chunks(monkeypatch, tmp_path):
+    monkeypatch.setenv("TINKER_OPENAI_API_KEY", "k")
+    path = _multipage_pdf(tmp_path, 5)
+    fake = _SequencedFakeHTTP([_openai_ok([1, 2]), _openai_ok([3, 4]),
+                               _openai_ok([5])])
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(providers.OpenAIProvider, "MAX_PAGES_PER_CHUNK", 2)
+    res = providers.OpenAIProvider(model="gpt-5").parse(path)
+    assert res.ok, res.error
+    assert fake.calls == 3
+    assert [b["metadata"]["page"]["number"] for b in res.blocks] == [1, 2, 3, 4, 5]
+    assert res.input_tokens == 300 and res.output_tokens == 150
+    assert res.raw_summary["chunks"] == 3
+    texts = [b["messages"][0]["content"][0]["text"] for b in fake.bodies]
+    assert "pages 1 through 2" in texts[0]
+    assert "pages 3 through 4" in texts[1]
+    assert "pages 5 through 5" in texts[2]
+
+
+def test_openai_repairs_local_page_numbering(monkeypatch, tmp_path):
+    # model ignores the global-numbering instruction; pages get shifted
+    monkeypatch.setenv("TINKER_OPENAI_API_KEY", "k")
+    path = _multipage_pdf(tmp_path, 4)
+    fake = _SequencedFakeHTTP([_openai_ok([1, 2]), _openai_ok([1, 2])])
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(providers.OpenAIProvider, "MAX_PAGES_PER_CHUNK", 2)
+    res = providers.OpenAIProvider(model="gpt-5").parse(path)
+    assert res.ok, res.error
+    assert [b["metadata"]["page"]["number"] for b in res.blocks] == [1, 2, 3, 4]
+
+
+def _gemini_ok(pages, in_tok=100, out_tok=50):
+    blocks = [{"page": p, "type": "text", "content": f"page {p} text"}
+              for p in pages]
+    return {"candidates": [{"finishReason": "STOP",
+                            "content": {"parts": [{"text": json.dumps({"blocks": blocks})}]}}],
+            "usageMetadata": {"promptTokenCount": in_tok,
+                              "candidatesTokenCount": out_tok}}
+
+
+def test_gemini_splits_large_pdf_and_merges_chunks(monkeypatch, tmp_path):
+    monkeypatch.setenv("TINKER_GEMINI_API_KEY", "k")
+    path = _multipage_pdf(tmp_path, 4)
+    fake = _SequencedFakeHTTP([_gemini_ok([1, 2]), _gemini_ok([3, 4])])
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(providers.GeminiProvider, "MAX_PAGES_PER_CHUNK", 2)
+    res = providers.GeminiProvider().parse(path)
+    assert res.ok, res.error
+    assert fake.calls == 2
+    assert [b["metadata"]["page"]["number"] for b in res.blocks] == [1, 2, 3, 4]
+    assert res.input_tokens == 200 and res.output_tokens == 100
+    assert res.raw_summary["chunks"] == 2
+
+
+def test_gemini_reports_finish_reason_when_no_parts(monkeypatch, tmp_path):
+    monkeypatch.setenv("TINKER_GEMINI_API_KEY", "k")
+    fake = _FakeHTTP({"candidates": [{"finishReason": "SAFETY"}]})
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake)
+    with pytest.raises(RuntimeError, match=r"finishReason=SAFETY"):
+        providers.GeminiProvider().parse(_pdf(tmp_path))

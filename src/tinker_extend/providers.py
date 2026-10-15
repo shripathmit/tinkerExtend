@@ -46,6 +46,83 @@ Rules:
 - If a page has no extractable content, emit {"page": N, "type": "text", "content": ""}."""
 
 
+def extraction_prompt(page_start: int | None = None,
+                      page_end: int | None = None) -> str:
+    """The shared extraction prompt, optionally scoped to a page range.
+
+    Chunk prompts name the ORIGINAL 1-based page numbers so blocks merged
+    from several requests keep global numbering.
+    """
+    if page_start is None:
+        return EXTRACTION_PROMPT
+    return (
+        f"The attached PDF is an excerpt: pages {page_start} through {page_end} "
+        f"of the original document. In the \"page\" field of every block, use the "
+        f"ORIGINAL page numbers ({page_start}-{page_end}); never renumber from 1.\n\n"
+        + EXTRACTION_PROMPT
+    )
+
+
+def _pdf_page_count(path: str) -> int:
+    from pypdf import PdfReader
+    try:
+        return len(PdfReader(path).pages)
+    except Exception as exc:
+        raise RuntimeError(f"could not read PDF page count: {exc}") from exc
+
+
+def _write_page_range(src: str, start: int, end: int, dest: str) -> None:
+    """Copy pages [start, end) (0-based) of src into a new PDF at dest."""
+    from pypdf import PdfReader, PdfWriter
+    try:
+        reader = PdfReader(src)
+        writer = PdfWriter()
+        for p in reader.pages[start:end]:
+            writer.add_page(p)
+        with open(dest, "wb") as f:
+            writer.write(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not split PDF pages {start + 1}-{end}: {exc}") from exc
+
+
+def _chunk_ranges(path: str, max_bytes_per_chunk: int,
+                  max_pages_per_chunk: int) -> list[tuple[int, int]]:
+    """Split a PDF into (start, end) 0-based page ranges.
+
+    Each chunk stays under max_bytes_per_chunk (estimated from the average
+    bytes/page) and holds at most max_pages_per_chunk pages, so no single
+    LLM request exceeds the model's input or output token limits.
+    """
+    total_pages = _pdf_page_count(path)
+    if total_pages <= 0:
+        raise RuntimeError("PDF has no readable pages")
+    bytes_per_page = max(os.path.getsize(path), 1) / total_pages
+    pages_by_bytes = max(1, int(max_bytes_per_chunk / bytes_per_page))
+    per_chunk = max(1, min(pages_by_bytes, max_pages_per_chunk))
+    return [(s, min(s + per_chunk, total_pages))
+            for s in range(0, total_pages, per_chunk)]
+
+
+def _globalize_block_pages(blocks: list[dict], start_1: int, end_1: int) -> None:
+    """Shift chunk blocks that look 1-based-local to global page numbers.
+
+    The chunk prompt asks for original page numbers, but if every block page
+    falls inside 1..chunk_span instead of start_1..end_1, assume the model
+    renumbered locally and shift. Mutates blocks in place; a no-op for the
+    first chunk (start_1 == 1).
+    """
+    span = end_1 - start_1 + 1
+    pages = [p for p in (block_page_number(b) for b in blocks) if p is not None]
+    if not pages:
+        return
+    if max(pages) <= span and (min(pages) < start_1 or max(pages) > end_1):
+        for b in blocks:
+            pg = (b.get("metadata") or {}).get("page") or {}
+            if isinstance(pg.get("number"), int):
+                pg["number"] += start_1 - 1
+
+
 def normalize_llm_blocks(payload: dict) -> list[dict]:
     """LLM JSON payload -> Extend-shaped blocks.
 
@@ -219,6 +296,17 @@ class OpenAIProvider(ParseProvider):
                   "gpt-5": 128_000, "gpt-5-mini": 128_000}
     DEFAULT_MAX_OUTPUT = 16_384
 
+    # Input token limits per model (gpt-5 reports 272k; 4o-class is 128k).
+    # Large PDFs are split into page-range chunks so no request exceeds
+    # CHUNK_FRACTION of the input limit (base64 inflates bytes ~4/3 and
+    # tokenizes roughly 1 token per 3.5 chars -> ~0.4 tokens/byte).
+    INPUT_LIMIT = {"gpt-4o": 128_000, "gpt-4o-mini": 128_000,
+                   "gpt-5": 272_000, "gpt-5-mini": 272_000}
+    DEFAULT_INPUT_LIMIT = 128_000
+    CHUNK_FRACTION = 0.70
+    TOKENS_PER_BYTE = 0.4
+    MAX_PAGES_PER_CHUNK = 8
+
     default_model = "gpt-4o"
     model_env = "TINKER_OPENAI_PARSE_MODEL"
 
@@ -228,6 +316,12 @@ class OpenAIProvider(ParseProvider):
 
     def max_output_tokens(self) -> int:
         return self.MAX_OUTPUT.get(self._model, self.DEFAULT_MAX_OUTPUT)
+
+    def max_input_tokens(self) -> int:
+        return self.INPUT_LIMIT.get(self._model, self.DEFAULT_INPUT_LIMIT)
+
+    def _chunk_byte_budget(self) -> int:
+        return int(self.max_input_tokens() * self.CHUNK_FRACTION / self.TOKENS_PER_BYTE)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -241,16 +335,53 @@ class OpenAIProvider(ParseProvider):
     def parse(self, path: str) -> ProviderResult:
         if not self.api_key:
             raise RuntimeError("TINKER_OPENAI_API_KEY not set")
-        with open(path, "rb") as f:
+        ranges = _chunk_ranges(path, self._chunk_byte_budget(),
+                               self.MAX_PAGES_PER_CHUNK)
+        blocks: list[dict] = []
+        in_tok = out_tok = 0
+        if len(ranges) == 1:
+            b, i, o = self._parse_one(path, extraction_prompt())
+            blocks, in_tok, out_tok = b, i, o
+        else:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="tinker-playground-") as tmp:
+                for n, (st, en) in enumerate(ranges):
+                    chunk_path = os.path.join(tmp, f"chunk-{n:03d}.pdf")
+                    _write_page_range(path, st, en, chunk_path)
+                    b, i, o = self._parse_one(chunk_path,
+                                              extraction_prompt(st + 1, en))
+                    _globalize_block_pages(b, st + 1, en)
+                    blocks.extend(b)
+                    in_tok += i
+                    out_tok += o
+        pages = len({p for p in (block_page_number(b) for b in blocks) if p is not None})
+        rate_in = float(os.environ.get("TINKER_OPENAI_RATE_IN",
+                                       self.RATES.get(self._model, (2.50, 10.00))[0]))
+        rate_out = float(os.environ.get("TINKER_OPENAI_RATE_OUT",
+                                        self.RATES.get(self._model, (2.50, 10.00))[1]))
+        return ProviderResult(
+            provider=self.name, model=self._model, blocks=blocks, pages=pages,
+            cost_usd=_usd(in_tok, out_tok, rate_in, rate_out),
+            cost_note="approximate (tokens x list rate)",
+            input_tokens=in_tok, output_tokens=out_tok,
+            raw_summary={"model": self._model, "chunks": len(ranges)})
+
+    def _parse_one(self, chunk_path: str,
+                   prompt: str) -> tuple[list[dict], int, int]:
+        """One chat-completions extraction call.
+
+        Returns (blocks, input_tokens, output_tokens).
+        """
+        with open(chunk_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         body = {
             "model": self._model,
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": EXTRACTION_PROMPT},
+                    {"type": "text", "text": prompt},
                     {"type": "file", "file": {
-                        "filename": os.path.basename(path),
+                        "filename": os.path.basename(chunk_path),
                         "file_data": f"data:application/pdf;base64,{b64}"}},
                 ],
             }],
@@ -284,18 +415,7 @@ class OpenAIProvider(ParseProvider):
         usage = data.get("usage") or {}
         in_tok = int(usage.get("prompt_tokens") or 0)
         out_tok = int(usage.get("completion_tokens") or 0)
-        rate_in = float(os.environ.get("TINKER_OPENAI_RATE_IN",
-                                       self.RATES.get(self._model, (2.50, 10.00))[0]))
-        rate_out = float(os.environ.get("TINKER_OPENAI_RATE_OUT",
-                                        self.RATES.get(self._model, (2.50, 10.00))[1]))
-        blocks = normalize_llm_blocks(payload)
-        pages = len({p for p in (block_page_number(b) for b in blocks) if p is not None})
-        return ProviderResult(
-            provider=self.name, model=self._model, blocks=blocks, pages=pages,
-            cost_usd=_usd(in_tok, out_tok, rate_in, rate_out),
-            cost_note="approximate (tokens x list rate)",
-            input_tokens=in_tok, output_tokens=out_tok,
-            raw_summary={"model": self._model})
+        return normalize_llm_blocks(payload), in_tok, out_tok
 
 
 class GeminiProvider(ParseProvider):
@@ -312,6 +432,14 @@ class GeminiProvider(ParseProvider):
                   "gemini-2.5-pro": 65_536}
     DEFAULT_MAX_OUTPUT = 8_192
 
+    # Input context is 1M tokens for current models; chunking is driven by
+    # the output cap instead (MAX_PAGES_PER_CHUNK keeps each response well
+    # under it), with the byte budget as a backstop for image-heavy pages.
+    INPUT_LIMIT = 1_000_000
+    CHUNK_FRACTION = 0.70
+    TOKENS_PER_BYTE = 0.4
+    MAX_PAGES_PER_CHUNK = 10
+
     default_model = "gemini-3.8-flash"
     model_env = "TINKER_GEMINI_PARSE_MODEL"
 
@@ -322,6 +450,9 @@ class GeminiProvider(ParseProvider):
 
     def max_output_tokens(self) -> int:
         return self.MAX_OUTPUT.get(self._model, self.DEFAULT_MAX_OUTPUT)
+
+    def _chunk_byte_budget(self) -> int:
+        return int(self.INPUT_LIMIT * self.CHUNK_FRACTION / self.TOKENS_PER_BYTE)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
@@ -335,11 +466,48 @@ class GeminiProvider(ParseProvider):
     def parse(self, path: str) -> ProviderResult:
         if not self.api_key:
             raise RuntimeError("TINKER_GEMINI_API_KEY not set")
-        with open(path, "rb") as f:
+        ranges = _chunk_ranges(path, self._chunk_byte_budget(),
+                               self.MAX_PAGES_PER_CHUNK)
+        blocks: list[dict] = []
+        in_tok = out_tok = 0
+        if len(ranges) == 1:
+            b, i, o = self._parse_one(path, extraction_prompt())
+            blocks, in_tok, out_tok = b, i, o
+        else:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="tinker-playground-") as tmp:
+                for n, (st, en) in enumerate(ranges):
+                    chunk_path = os.path.join(tmp, f"chunk-{n:03d}.pdf")
+                    _write_page_range(path, st, en, chunk_path)
+                    b, i, o = self._parse_one(chunk_path,
+                                              extraction_prompt(st + 1, en))
+                    _globalize_block_pages(b, st + 1, en)
+                    blocks.extend(b)
+                    in_tok += i
+                    out_tok += o
+        pages = len({p for p in (block_page_number(b) for b in blocks) if p is not None})
+        rate_in = float(os.environ.get("TINKER_GEMINI_RATE_IN",
+                                       self.RATES.get(self._model, (0.75, 3.75))[0]))
+        rate_out = float(os.environ.get("TINKER_GEMINI_RATE_OUT",
+                                        self.RATES.get(self._model, (0.75, 3.75))[1]))
+        return ProviderResult(
+            provider=self.name, model=self._model, blocks=blocks, pages=pages,
+            cost_usd=_usd(in_tok, out_tok, rate_in, rate_out),
+            cost_note="approximate (tokens x list rate)",
+            input_tokens=in_tok, output_tokens=out_tok,
+            raw_summary={"model": self._model, "chunks": len(ranges)})
+
+    def _parse_one(self, chunk_path: str,
+                   prompt: str) -> tuple[list[dict], int, int]:
+        """One generateContent extraction call.
+
+        Returns (blocks, input_tokens, output_tokens).
+        """
+        with open(chunk_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         body = {
             "contents": [{"parts": [
-                {"text": EXTRACTION_PROMPT},
+                {"text": prompt},
                 {"inlineData": {"mimeType": "application/pdf", "data": b64}},
             ]}],
             "generationConfig": {"responseMimeType": "application/json",
@@ -367,22 +535,13 @@ class GeminiProvider(ParseProvider):
             text = cand["content"]["parts"][0]["text"]
             payload = json.loads(_strip_fences(text))
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Gemini returned unparseable output: {exc}") from exc
+            reason = cand.get("finishReason") or "unknown"
+            raise RuntimeError(
+                f"Gemini returned no parsable text (finishReason={reason})") from exc
         usage = data.get("usageMetadata") or {}
         in_tok = int(usage.get("promptTokenCount") or 0)
         out_tok = int(usage.get("candidatesTokenCount") or 0)
-        rate_in = float(os.environ.get("TINKER_GEMINI_RATE_IN",
-                                       self.RATES.get(self._model, (0.10, 0.40))[0]))
-        rate_out = float(os.environ.get("TINKER_GEMINI_RATE_OUT",
-                                        self.RATES.get(self._model, (0.10, 0.40))[1]))
-        blocks = normalize_llm_blocks(payload)
-        pages = len({p for p in (block_page_number(b) for b in blocks) if p is not None})
-        return ProviderResult(
-            provider=self.name, model=self._model, blocks=blocks, pages=pages,
-            cost_usd=_usd(in_tok, out_tok, rate_in, rate_out),
-            cost_note="approximate (tokens x list rate)",
-            input_tokens=in_tok, output_tokens=out_tok,
-            raw_summary={"model": self._model})
+        return normalize_llm_blocks(payload), in_tok, out_tok
 
 
 _PROVIDERS: dict[str, type[ParseProvider]] = {

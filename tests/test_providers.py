@@ -243,7 +243,7 @@ def test_openai_requests_stay_within_model_output_limit(monkeypatch, tmp_path, m
 
 
 @pytest.mark.parametrize("model, cap", [
-    ("gemini-2.0-flash", 8_192), ("gemini-2.5-flash", 65_536), ("unknown-model", 8_192),
+    ("gemini-3.8-flash", 65_536), ("gemini-2.5-flash", 65_536), ("unknown-model", 8_192),
 ])
 def test_gemini_requests_stay_within_model_output_limit(monkeypatch, tmp_path, model, cap):
     monkeypatch.setenv("TINKER_GEMINI_API_KEY", "k")
@@ -264,7 +264,7 @@ def test_truncated_llm_output_is_reported_clearly(monkeypatch, tmp_path):
         providers.OpenAIProvider().parse(_pdf(tmp_path))
     monkeypatch.setattr(providers.urllib.request, "urlopen", _FakeHTTP(
         {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": '{"blocks": ['}]}}]}))
-    with pytest.raises(RuntimeError, match=r"Output truncated: gemini-2.0-flash stopped at its 8,192-token"):
+    with pytest.raises(RuntimeError, match=r"Output truncated: gemini-3.8-flash stopped at its 65,536-token"):
         providers.GeminiProvider().parse(_pdf(tmp_path))
 
 

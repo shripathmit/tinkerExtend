@@ -303,15 +303,16 @@ class GeminiProvider(ParseProvider):
 
     name = "gemini"
     # Approximate list rates ($ per 1M tokens); override via env.
-    RATES = {"gemini-2.0-flash": (0.10, 0.40), "gemini-2.5-flash": (0.30, 2.50),
+    # gemini-2.0-flash was retired by Google; 3.8-flash is the current default.
+    RATES = {"gemini-3.8-flash": (0.75, 3.75), "gemini-2.5-flash": (0.30, 2.50),
              "gemini-2.5-pro": (1.25, 10.00)}
 
     # Maximum output tokens per model; requests above the limit fail.
-    MAX_OUTPUT = {"gemini-2.0-flash": 8_192, "gemini-2.5-flash": 65_536,
+    MAX_OUTPUT = {"gemini-3.8-flash": 65_536, "gemini-2.5-flash": 65_536,
                   "gemini-2.5-pro": 65_536}
     DEFAULT_MAX_OUTPUT = 8_192
 
-    default_model = "gemini-2.0-flash"
+    default_model = "gemini-3.8-flash"
     model_env = "TINKER_GEMINI_PARSE_MODEL"
 
     def __init__(self, model: str | None = None) -> None:

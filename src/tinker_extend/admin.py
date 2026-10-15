@@ -466,10 +466,22 @@ async def api_provider_run_start(file: UploadFile = File(...),
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
                     raise ValueError("file too large")
+                out.write(chunk)
     except ValueError:
         if os.path.exists(dest):
             os.remove(dest)
         return JSONResponse({"error": "file too large"}, status_code=400)
+    # Defensive: never hand an empty or non-PDF file to the providers.
+    # (A missing write once shipped empty files here; fail loudly instead.)
+    try:
+        with open(dest, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        head = b""
+    if not head or b"%PDF-" not in head:
+        os.remove(dest)
+        return JSONResponse({"error": "upload failed: file is empty or not a PDF"},
+                            status_code=400)
     kb = _kb()
     try:
         run_id = kb.create_provider_run(os.path.basename(dest), dest, names)

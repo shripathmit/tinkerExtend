@@ -1,7 +1,7 @@
 """tinker_extend: Extend-powered document ingestion → SQLite knowledge base."""
 
 # Defined before the imports below so submodules can read it.
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 from .config import Config, load_config
 from .extend_client import ExtendClient, ExtendAPIError, ExtendRunFailed

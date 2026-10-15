@@ -130,6 +130,40 @@ def test_compare_providers_stub(monkeypatch, tmp_path):
     assert out["filename"] == "d.pdf"
 
 
+def test_compare_providers_dict_selection(monkeypatch, tmp_path):
+    import tinker_extend.pipeline as pipe
+    monkeypatch.setattr(pipe, "_source_text_words", lambda p: "alpha " * 100)
+
+    seen = {}
+
+    class Stub(providers.ParseProvider):
+        name = "stub"
+
+        def __init__(self, model=None):
+            super().__init__(model)
+            seen["model"] = self.model
+
+        def parse(self, path):
+            return ProviderResult(provider="stub", model=self.model,
+                                  blocks=_blocks(), pages=2, cost_usd=0.01)
+
+    monkeypatch.setitem(providers._PROVIDERS, "stub", Stub)
+    out = compare_providers(str(tmp_path / "d.pdf"), {"stub": "stub-xl", "nope": "z"})
+    assert set(out["providers"]) == {"stub"}
+    assert seen["model"] == "stub-xl"
+    assert out["providers"]["stub"]["model"] == "stub-xl"
+
+
+def test_provider_status_has_models(monkeypatch):
+    for k in ("EXTEND_API_KEY", "TINKER_OPENAI_API_KEY",
+              "TINKER_GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    st = {p["name"]: p for p in provider_status()}
+    assert st["openai"]["models"] == list(providers.OpenAIProvider.RATES)
+    assert st["extend"]["models"] == ["parse_performance", "parse_light"]
+    assert st["extend"]["default_model"] == "parse_performance"
+
+
 def test_provider_run_store(tmp_path):
     from tinker_extend.store import KnowledgeBase
     kb = KnowledgeBase(str(tmp_path / "kb.sqlite3"))

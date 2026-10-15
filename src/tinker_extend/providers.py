@@ -113,18 +113,32 @@ class ProviderResult:
 
 
 class ParseProvider:
-    """Interface every bake-off provider implements."""
+    """Interface every bake-off provider implements.
+
+    `model` selects the extraction model/engine for this run; when None
+    the provider default is used. The Data tab offers available_models()
+    in a dropdown.
+    """
 
     name = "base"
+    default_model = ""
+
+    def __init__(self, model: str | None = None) -> None:
+        self._model = model or self.default_model
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
         """(is_configured, reason_when_not). Never raises."""
         return False, "not implemented"
 
+    @classmethod
+    def available_models(cls) -> list[str]:
+        """Model ids the UI offers for this provider."""
+        return [cls.default_model] if cls.default_model else []
+
     @property
     def model(self) -> str:
-        return ""
+        return self._model
 
     def parse(self, path: str) -> ProviderResult:
         raise NotImplementedError
@@ -134,14 +148,21 @@ class ExtendProvider(ParseProvider):
     """Extend.ai parse — the production path, for reference in the bake-off."""
 
     name = "extend"
+    default_model = "parse_performance"
 
-    def __init__(self) -> None:
-        self.engine = os.environ.get("TINKER_PLAYGROUND_EXTEND_ENGINE", "parse_performance")
+    def __init__(self, model: str | None = None) -> None:
+        super().__init__(model)
+        self.engine = self._model or os.environ.get(
+            "TINKER_PLAYGROUND_EXTEND_ENGINE", "parse_performance")
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
         key = os.environ.get("EXTEND_API_KEY", "")
         return (True, "") if key else (False, "Set EXTEND_API_KEY to enable")
+
+    @classmethod
+    def available_models(cls) -> list[str]:
+        return ["parse_performance", "parse_light"]
 
     @property
     def model(self) -> str:
@@ -178,18 +199,23 @@ class OpenAIProvider(ParseProvider):
     RATES = {"gpt-4o": (2.50, 10.00), "gpt-4o-mini": (0.15, 0.60),
              "gpt-5": (1.25, 10.00), "gpt-5-mini": (0.25, 2.00)}
 
-    def __init__(self) -> None:
+    default_model = "gpt-4o"
+
+    def __init__(self, model: str | None = None) -> None:
+        super().__init__(model)
         self.api_key = os.environ.get("TINKER_OPENAI_API_KEY", "")
-        self._model = os.environ.get("TINKER_OPENAI_PARSE_MODEL", "gpt-4o")
+        if not self._model:
+            self._model = os.environ.get("TINKER_OPENAI_PARSE_MODEL",
+                                         self.default_model)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
         key = os.environ.get("TINKER_OPENAI_API_KEY", "")
         return (True, "") if key else (False, "Set TINKER_OPENAI_API_KEY to enable")
 
-    @property
-    def model(self) -> str:
-        return self._model
+    @classmethod
+    def available_models(cls) -> list[str]:
+        return list(cls.RATES)
 
     def parse(self, path: str) -> ProviderResult:
         if not self.api_key:
@@ -256,19 +282,24 @@ class GeminiProvider(ParseProvider):
     RATES = {"gemini-2.0-flash": (0.10, 0.40), "gemini-2.5-flash": (0.30, 2.50),
              "gemini-2.5-pro": (1.25, 10.00)}
 
-    def __init__(self) -> None:
+    default_model = "gemini-2.0-flash"
+
+    def __init__(self, model: str | None = None) -> None:
+        super().__init__(model)
         self.api_key = (os.environ.get("TINKER_GEMINI_API_KEY", "")
                         or os.environ.get("GOOGLE_API_KEY", ""))
-        self._model = os.environ.get("TINKER_GEMINI_PARSE_MODEL", "gemini-2.0-flash")
+        if not self._model:
+            self._model = os.environ.get("TINKER_GEMINI_PARSE_MODEL",
+                                         self.default_model)
 
     @classmethod
     def configured(cls) -> tuple[bool, str]:
         key = os.environ.get("TINKER_GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
         return (True, "") if key else (False, "Set TINKER_GEMINI_API_KEY to enable")
 
-    @property
-    def model(self) -> str:
-        return self._model
+    @classmethod
+    def available_models(cls) -> list[str]:
+        return list(cls.RATES)
 
     def parse(self, path: str) -> ProviderResult:
         if not self.api_key:
@@ -328,16 +359,19 @@ _PROVIDERS: dict[str, type[ParseProvider]] = {
 
 
 def provider_status() -> list[dict]:
-    """For the Data tab: which providers can run right now."""
+    """For the Data tab: which providers can run right now, and their models."""
     out = []
     for name in PROVIDERS:
         cls = _PROVIDERS[name]
         ok, reason = cls.configured()
         try:
-            model = cls().model
+            models = cls.available_models()
+            default = cls().model
         except Exception:
-            model = ""
-        out.append({"name": name, "configured": ok, "reason": reason, "model": model})
+            models, default = [], ""
+        out.append({"name": name, "configured": ok, "reason": reason,
+                    "model": default, "models": models,
+                    "default_model": default})
     return out
 
 
@@ -388,14 +422,26 @@ def pick_winners(scored: dict) -> dict:
     }
 
 
-def compare_providers(path: str, names: list[str] | None = None) -> dict:
-    """Parse `path` with each named provider and score them all."""
+def compare_providers(path: str,
+                      selections: list[str] | dict[str, str] | None = None) -> dict:
+    """Parse `path` with each selected provider and score them all.
+
+    `selections` is None (every provider, default models), a list of
+    provider names, or {provider_name: model} for per-provider models.
+    """
     import datetime
 
-    names = [n for n in (names or list(PROVIDERS)) if n in _PROVIDERS] or list(PROVIDERS)
+    if selections is None:
+        sel: dict[str, str | None] = {n: None for n in PROVIDERS}
+    elif isinstance(selections, dict):
+        sel = {n: m for n, m in selections.items() if n in _PROVIDERS}
+    else:
+        sel = {n: None for n in selections if n in _PROVIDERS}
+    if not sel:
+        sel = {n: None for n in PROVIDERS}
     scored: dict[str, dict] = {}
-    for name in names:
-        provider = _PROVIDERS[name]()
+    for name, model in sel.items():
+        provider = _PROVIDERS[name](model=model)
         started = time.monotonic()
         try:
             res = provider.parse(path)

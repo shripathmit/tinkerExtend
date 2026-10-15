@@ -1199,24 +1199,34 @@ function renderDataProviders() {
   const box = $('data-providers');
   if (!box) return;
   const ps = state.dataProviders || [];
-  box.innerHTML = ps.length ? ps.map((p) => `
+  box.innerHTML = ps.length ? ps.map((p) => {
+    const models = (p.models && p.models.length ? p.models : (p.model ? [p.model] : []));
+    const opts = models.map((m) => `<option value="${esc(m)}" ${m === p.default_model ? 'selected' : ''}>${esc(m)}</option>`).join('');
+    return `
     <label class="flex items-start gap-3 border border-hairline px-4 py-3 cursor-pointer ${p.configured ? 'hover:border-inkMuted' : 'opacity-60'} transition-colors">
       <input type="checkbox" data-provider="${esc(p.name)}" ${p.configured ? 'checked' : 'disabled'}
         class="mt-1 accent-ink">
       <span class="flex-1 min-w-0">
-        <span class="flex items-center gap-2">
+        <span class="flex items-center gap-2 flex-wrap">
           <span class="text-xs font-mono font-medium text-ink">${esc(p.name)}</span>
           <span class="font-mono text-[10px] px-1.5 py-px rounded-sm ${p.configured ? 'bg-emeraldOk/15 text-emeraldOk' : 'bg-amberWarn/15 text-amberWarn'}">${p.configured ? 'READY' : 'NO KEY'}</span>
         </span>
-        <span class="block text-[11px] text-inkFaint mt-1">${p.configured ? `model: ${esc(p.model)}` : esc(p.reason)}</span>
+        <span class="block text-[11px] text-inkFaint mt-1">${p.configured ? '' : esc(p.reason)}</span>
+        ${p.configured && models.length ? `<select data-model-for="${esc(p.name)}"
+          class="mt-2 w-full bg-transparent border border-hairline text-[11px] font-mono text-ink px-2 py-1.5 focus:outline-none focus:border-inkMuted cursor-pointer">${opts}</select>` : ''}
       </span>
-    </label>`).join('')
+    </label>`; }).join('')
     : '<p class="text-xs text-inkFaint">Could not load provider status.</p>';
 }
 
 function dataSelectedProviders() {
-  return [...document.querySelectorAll('#data-providers input[data-provider]:checked')]
-    .map((el) => el.dataset.provider);
+  const sel = {};
+  document.querySelectorAll('#data-providers input[data-provider]:checked').forEach((el) => {
+    const name = el.dataset.provider;
+    const dd = document.querySelector(`#data-providers select[data-model-for="${name}"]`);
+    sel[name] = dd ? dd.value : null;
+  });
+  return sel;
 }
 
 async function onDataRun() {
@@ -1224,7 +1234,8 @@ async function onDataRun() {
   const status = $('data-run-status');
   const btn = $('data-run-btn');
   if (!file) { status.textContent = 'Choose a PDF first.'; return; }
-  const providers = dataSelectedProviders();
+  const sel = dataSelectedProviders();
+  const providers = Object.keys(sel);
   if (!providers.length) { status.textContent = 'Select at least one configured provider.'; return; }
   btn.disabled = true;
   status.textContent = `Uploading ${file.name}…`;
@@ -1232,6 +1243,7 @@ async function onDataRun() {
     const form = new FormData();
     form.append('file', file);
     form.append('providers', JSON.stringify(providers));
+    form.append('models', JSON.stringify(sel));
     const r = await fetch('/api/admin/provider_runs', { method: 'POST', body: form });
     if (r.status === 401) throw new LockedError('locked');
     const body = await r.json();

@@ -398,12 +398,13 @@ def api_uploads():
             "files": sorted(os.listdir(UPLOAD_DIR))}
 
 
-def _run_provider_comparison(run_id: int, path: str, names: list[str]) -> None:
+def _run_provider_comparison(run_id: int, path: str,
+                             selections: dict[str, str]) -> None:
     """Background thread: run the provider bake-off, store the result."""
     kb = _kb()
     try:
         from .providers import compare_providers
-        result = compare_providers(path, names)
+        result = compare_providers(path, selections)
         kb.finish_provider_run(run_id, result, status="done")
     except Exception as exc:  # noqa: BLE001 - the row must record the failure
         kb.finish_provider_run(
@@ -423,9 +424,12 @@ def api_providers():
 
 @_api.post("/api/admin/provider_runs")
 async def api_provider_run_start(file: UploadFile = File(...),
-                                 providers: str = Form("[]")):
+                                 providers: str = Form("[]"),
+                                 models: str = Form("{}")):
     """Upload a PDF and start a parse-provider bake-off in the background.
 
+    `providers` is a JSON list of provider names; `models` an optional
+    JSON {provider: model} for per-provider model selection.
     Returns immediately; poll GET /api/admin/provider_runs/{id} for the
     result. The playground never touches the production knowledge base.
     """
@@ -436,6 +440,11 @@ async def api_provider_run_start(file: UploadFile = File(...),
         names = []
     if not names:
         names = list(PROVIDERS)
+    try:
+        model_sel = json.loads(models or "{}")
+    except (json.JSONDecodeError, TypeError):
+        model_sel = {}
+    selections = {n: model_sel.get(n) for n in names}
     name = os.path.basename(file.filename or "").strip()
     if not name.lower().endswith(".pdf"):
         return JSONResponse({"error": "playground accepts PDF files only"},
@@ -467,9 +476,10 @@ async def api_provider_run_start(file: UploadFile = File(...),
     finally:
         kb.close()
     t = threading.Thread(target=_run_provider_comparison,
-                         args=(run_id, dest, names), daemon=True)
+                         args=(run_id, dest, selections), daemon=True)
     t.start()
-    return {"id": run_id, "status": "running", "providers": names}
+    return {"id": run_id, "status": "running", "providers": names,
+            "models": selections}
 
 
 @_api.get("/api/admin/provider_runs")

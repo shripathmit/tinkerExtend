@@ -38,6 +38,7 @@ router = APIRouter()
 KB_PATH = os.environ.get("TINKER_KB_PATH", "./kb.sqlite3")
 SEED_DIR = os.environ.get("TINKER_SEED_DIR", "./seed_docs")
 UPLOAD_DIR = os.environ.get("TINKER_UPLOAD_DIR", "./uploads")
+PAGE_IMG_DIR = os.environ.get("TINKER_PAGE_IMG_DIR", "./page_images")
 MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # per file
 PLAYGROUND_DIR = os.environ.get("TINKER_PLAYGROUND_DIR", "/app/data/playground")
 
@@ -823,6 +824,46 @@ def _with_session(resp, signed_in: bool):
     else:
         resp.delete_cookie(ADMIN_COOKIE)
     return resp
+
+
+@_api.delete("/api/admin/documents/{doc_id}")
+def api_delete_document(doc_id: str):
+    """Permanently delete a document and all its derived data.
+
+    Removes the documents row (cascades to chunks and parse telemetry),
+    FTS entries, reparse history, rendered page images, and the source
+    upload when it lives inside the upload dir. Bumps the vectors revision
+    so cached embeddings and golden runs invalidate. Cannot be undone.
+    """
+    kb = _kb()
+    try:
+        row = kb.conn.execute(
+            "SELECT doc_id, source FROM documents WHERE doc_id = ?",
+            (doc_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        source = row["source"] or ""
+        name = os.path.basename(source)
+        chunks = kb.conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (doc_id,)).fetchone()[0]
+        kb.delete_document(doc_id)
+    finally:
+        kb.close()
+    removed = []
+    img_dir = os.path.join(PAGE_IMG_DIR, doc_id)
+    if os.path.isdir(img_dir):
+        shutil.rmtree(img_dir, ignore_errors=True)
+        removed.append("page images")
+    try:
+        up = os.path.realpath(UPLOAD_DIR)
+        sp = os.path.realpath(source)
+        if sp.startswith(up + os.sep) and os.path.isfile(sp):
+            os.remove(sp)
+            removed.append("source file")
+    except OSError:
+        pass
+    return {"deleted": True, "doc_id": doc_id, "name": name,
+            "chunks": chunks, "removed": removed}
 
 
 @router.get("/api/session")

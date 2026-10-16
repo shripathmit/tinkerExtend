@@ -788,8 +788,9 @@ async function loadFidelity() {
         <td class="py-4 pl-6 text-right whitespace-nowrap">${r.flags.length
           ? `<button type="button" data-inspect="${esc(r.doc_id)}" class="text-amberWarn hover:text-ink underline underline-offset-4">Inspect →</button>`
           : '<span class="text-emeraldOk">Verified</span>'}</td>
+        <td class="py-4 pl-4 text-right whitespace-nowrap"><button type="button" data-delete-doc="${esc(r.doc_id)}" data-doc-name="${esc(r.name)}" class="text-inkFaint hover:text-ink underline underline-offset-4 transition-colors" title="Permanently delete this document">Delete</button></td>
       </tr>`;
-  }).join('') : '<tr><td colspan="6" class="py-6 text-inkFaint">No documents ingested yet.</td></tr>';
+  }).join('') : '<tr><td colspan="7" class="py-6 text-inkFaint">No documents ingested yet.</td></tr>';
 }
 
 function disarmReparseAll() {
@@ -1134,12 +1135,13 @@ function openDocInWorkspace(docId, page = 1) {
 }
 
 document.addEventListener('click', async (ev) => {
-  const t = ev.target.closest('[data-source],[data-example],[data-inspect],[data-open-doc],[data-chunk],[data-issue],[data-search-type],[data-fb-resolve],[data-dl-retry],[data-dl-resolve],.cite');
+  const t = ev.target.closest('[data-source],[data-example],[data-inspect],[data-open-doc],[data-chunk],[data-issue],[data-search-type],[data-fb-resolve],[data-dl-retry],[data-dl-resolve],[data-delete-doc],.cite');
   if (!t) return;
   if (t.matches('.cite')) { const n = parseInt(t.dataset.n, 10) - 1; if (state.result && state.result.passages[n]) selectSource(n); return; }
   if (t.dataset.source !== undefined) { selectSource(parseInt(t.dataset.source, 10)); return; }
   if (t.dataset.example !== undefined) { $('query-input').value = t.dataset.example; setSearchType('ask'); return; }
   if (t.dataset.inspect !== undefined) { openFidelityDetail(t.dataset.inspect); return; }
+  if (t.dataset.deleteDoc !== undefined) { deleteDocument(t.dataset.deleteDoc, t.dataset.docName || 'this document'); return; }
   if (t.dataset.openDoc !== undefined) { openDocInWorkspace(t.dataset.openDoc, parseInt(t.dataset.openPage || '1', 10)); return; }
   if (t.dataset.chunk !== undefined && t.closest('#document-sheet')) { focusChunkInViewer(t.dataset.chunk); return; }
   if (t.dataset.issue !== undefined) { pickIssue(t.dataset.issue); return; }
@@ -1165,6 +1167,16 @@ function setSearchType(type) {
   store.set('tx.searchType', type);
   renderSearchType();
   if ($('query-input').value.trim()) runQuery();
+}
+
+async function deleteDocument(docId, name) {
+  if (!confirm(`Permanently delete "${name}"?\n\nRemoves its chunks, search index entries, telemetry, page images and source file. This cannot be undone.`)) return;
+  try {
+    await api(`/api/admin/documents/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+    await loadFidelity();
+  } catch (e) {
+    if (!(e instanceof LockedError)) alert(`Delete failed: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

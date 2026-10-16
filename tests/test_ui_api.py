@@ -268,3 +268,45 @@ def test_doc_fidelity_groups_examples_with_leak_lines(env):
     assert groups["empty"]["total"] == 1 and groups["empty"]["items"][0]["page"] == 2
     assert d["num_chunks"] == 3
     assert "garbled" not in groups  # only issue kinds that occur are returned
+
+
+def test_delete_document_removes_everything(env, tmp_path, monkeypatch):
+    c = env["client"]
+    doc_id = env["doc_id"]
+    img_dir = tmp_path / "pages"
+    monkeypatch.setattr(admin, "PAGE_IMG_DIR", str(img_dir))
+    # point the upload dir at the seed dir so the source file qualifies
+    monkeypatch.setattr(admin, "UPLOAD_DIR", str(tmp_path / "seed"))
+
+    kb = KnowledgeBase(env["kb_path"])
+    assert kb.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+    kb.close()
+
+    r = c.delete(f"/api/admin/documents/{doc_id}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deleted"] is True
+    assert body["name"] == "filing.pdf"
+    assert body["chunks"] == 3
+    assert set(body["removed"]) == {"page images", "source file"}
+
+    kb = KnowledgeBase(env["kb_path"])
+    try:
+        assert kb.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+        assert kb.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+        assert kb.conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0] == 0
+        assert kb.conn.execute("SELECT COUNT(*) FROM parse_telemetry").fetchone()[0] == 0
+    finally:
+        kb.close()
+    assert not (img_dir / doc_id).exists()
+    assert not os.path.exists(env["src"])
+
+    r = c.delete(f"/api/admin/documents/{doc_id}")
+    assert r.status_code == 404
+
+
+def test_delete_document_requires_admin(env):
+    c = env["client"]
+    c.headers.pop("X-Admin-Code", None)
+    r = c.delete(f"/api/admin/documents/{env['doc_id']}")
+    assert r.status_code == 401

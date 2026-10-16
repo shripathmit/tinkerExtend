@@ -279,6 +279,7 @@ class KnowledgeBase:
             for cid in chunk_ids:
                 self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (cid,))
             self.conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            self.conn.execute("DELETE FROM reparse_history WHERE doc_id = ?", (doc_id,))
             self.conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
             self._bump_vectors_rev()
 

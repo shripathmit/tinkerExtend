@@ -75,6 +75,21 @@ def test_delete_document():
     kb.close()
 
 
+def test_delete_document_clears_reparse_history_and_telemetry():
+    kb = make_kb()
+    kb.upsert_document(sample_doc())
+    kb.add_chunks(sample_chunks())
+    kb.record_telemetry("hash1", "seed", "other", "parse_light",
+                        {"num_pages": 1}, 0.0, 0.0)
+    kb.add_reparse_history("hash1", "parse_performance", {}, {}, 0.01)
+    kb.delete_document("hash1")
+    assert kb.conn.execute("SELECT COUNT(*) FROM parse_telemetry").fetchone()[0] == 0
+    assert kb.conn.execute("SELECT COUNT(*) FROM reparse_history").fetchone()[0] == 0
+    assert kb.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    assert kb.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    kb.close()
+
+
 def test_search_natural_language_query():
     from tinker_extend.store import sanitize_fts_query, significant_terms
     kb = make_kb()

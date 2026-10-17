@@ -112,6 +112,13 @@ npx tailwindcss@3.4.17 -c src/tinker_extend/static/tailwind.config.js \
   -i src/tinker_extend/static/src/input.css -o src/tinker_extend/static/app.css --minify
 ```
 
+To remove a document, use **Delete** on its row in the Fidelity matrix
+(asks to confirm). This removes its passages, search entries, fidelity
+scores, re-parse history and page images, plus the source PDF if it was an
+upload (seed files are kept). Scripts can call
+`DELETE /api/admin/documents/{doc_id}` or
+`python -m tinker_extend.cli delete <doc_id>`.
+
 Re-parse needs the original file on the server (its stored path, the seed
 dir, or `TINKER_UPLOAD_DIR`), verified by content hash.
 

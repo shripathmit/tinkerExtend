@@ -102,3 +102,19 @@ def test_search_natural_language_query():
     assert kb.search("What is the CEO's hobby?") == []  # AND finds nothing, OR neither
     assert kb.search("???") == []
     kb.close()
+
+
+def test_cli_delete(tmp_path, capsys):
+    from tinker_extend import cli
+    db = str(tmp_path / "kb.sqlite3")
+    kb = KnowledgeBase(db)
+    kb.upsert_document(sample_doc())
+    kb.add_chunks(sample_chunks())
+    kb.close()
+    assert cli.main(["--db", db, "delete", "hash1"]) == 0
+    assert cli.main(["--db", db, "delete", "hash1"]) == 1  # already gone
+    out = capsys.readouterr().out
+    assert "deleted: hash1" in out and "not found: hash1" in out
+    kb = KnowledgeBase(db)
+    assert kb.stats()["documents"] == 0 and kb.search("refund") == []
+    kb.close()

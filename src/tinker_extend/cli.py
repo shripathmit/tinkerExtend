@@ -170,6 +170,24 @@ def cmd_embed_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Remove documents from the KB (chunks, search entries, telemetry)."""
+    kb = KnowledgeBase(_kb_path(args.db))
+    try:
+        missing = 0
+        for doc_id in args.doc_ids:
+            doc = kb.get_document(doc_id)
+            if not doc:
+                print(f"not found: {doc_id}")
+                missing += 1
+                continue
+            kb.delete_document(doc_id)
+            print(f"deleted: {doc_id} ({doc['source']})")
+    finally:
+        kb.close()
+    return 1 if missing else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tinker-extend", description="Extend-powered knowledge base")
     ap.add_argument("--db", default=None, help="SQLite KB path (default: $TINKER_KB_PATH or ./kb.sqlite3)")
@@ -208,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_b = sub.add_parser("embed-backfill", help="Embed stored chunks that have no vector yet")
     p_b.set_defaults(func=cmd_embed_backfill)
+
+    p_d = sub.add_parser("delete", help="Remove documents from the knowledge base by doc_id")
+    p_d.add_argument("doc_ids", nargs="+", help="Document ids (see `stats` or the Fidelity page URL)")
+    p_d.set_defaults(func=cmd_delete)
 
     args = ap.parse_args(argv)
     return args.func(args)

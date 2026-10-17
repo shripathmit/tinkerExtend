@@ -1173,6 +1173,9 @@ async function deleteDocument(docId, name) {
   if (!confirm(`Permanently delete "${name}"?\n\nRemoves its chunks, search index entries, telemetry, page images and source file. This cannot be undone.`)) return;
   try {
     await api(`/api/admin/documents/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+    state.overview = null; state.golden = null;
+    state.pageCache.clear();
+    loadStats();
     await loadFidelity();
   } catch (e) {
     if (!(e instanceof LockedError)) alert(`Delete failed: ${e.message}`);
